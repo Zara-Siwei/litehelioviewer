@@ -1,18 +1,10 @@
 # LiteHelioviewer
 
-LiteHelioviewer is a small local web viewer for daily solar-image work. It keeps the useful path from JHelioviewer: load common Helioviewer data sources, stack layers, keep an orthographic solar disk, rotate/reset the view, and open local FITS files by drag and drop.
+A lightweight local web viewer for Helioviewer solar images — the everyday JHelioviewer workflow (load recent SDO/HMI, AIA and LASCO frames, stack layers, rotate the solar disk) rebuilt as a tiny local web app. Double-click to start; everything runs locally except the image downloads themselves.
 
-The motivation is a lightweight web browsing version of Helioviewer: the everyday JHelioviewer workflow rebuilt as a tiny local web app that starts by double-clicking, without heavyweight desktop dependencies.
+## Quick start
 
-Planned next: a time-series visualization mode for CEA Patch crop regions anchored at fixed Carrington coordinates, so a tracked region can be watched as solar rotation carries features through it.
-
-## Start
-
-**Windows:** double-click `run-litehelioviewer.bat`. The launcher finds a Python 3.9+ interpreter — the `LITEHELIOVIEWER_PYTHON` environment variable, a `.venv` next to the script, or `python` on your PATH — installs the requirements on first run, starts the backend, and opens the browser at:
-
-```text
-http://127.0.0.1:8765
-```
+**Windows:** double-click `run-litehelioviewer.bat`. The launcher finds a Python 3.9+ interpreter, installs the requirements on first run, starts the backend, and opens the browser at `http://127.0.0.1:8765`.
 
 **Any OS:**
 
@@ -21,67 +13,39 @@ pip install -r requirements.txt
 python start.py
 ```
 
-The console window is the backend. Leave it open while using LiteHelioviewer. Closing that console stops the backend when it was started by this script.
-The current UI should show `Server 0.4.0 online` in the status area. If it does not, close old LiteHelioviewer consoles and start again with `run-litehelioviewer.bat`.
+## Features
 
-To check whether the backend is already running:
+- Download layers through the Helioviewer API (SDO/HMI magnetogram and continuum, SDO/AIA channels, SOHO/LASCO C2/C3) with nearest-frame local caching; stack layers with per-layer opacity and visibility.
+- Orthographic solar disk with a Stonyhurst grid: drag to rotate (trackball keeps the grabbed surface point under the cursor), mouse wheel to zoom.
+- Open local FITS files by drag and drop, and overlay PFSS magnetic field lines.
+- Collapsible, resizable sidebar and bottom crop dock; the main view reflows around them.
 
-```powershell
-.\status-litehelioviewer.bat
-```
+## CEA Patch crops
 
-## UI regression test
+1. Click **Crop**, then drag two points on the solar disk. A local Carrington-centered CEA (cylindrical equal-area) rectangle is computed and overlaid in green.
+2. Each crop opens as a tab (`CEA Patch 1`, `CEA Patch 2`, ...) in the bottom dock, with km axes centered on 0.
+3. On the crop image: mouse wheel zooms around the cursor, left-drag pans, **Reset** restores the fit view.
+4. In Crop mode, click a green region on the disk to select it, then drag its **A/B** handles to adjust. When regions overlap, the innermost one wins; partial overlaps go to the most recently drawn crop.
+5. **Hide region** toggles a crop's overlay on the disk without deleting it; **Clear** removes all crops.
 
-`tests\verify_ui.py` drives the real UI in headless Chrome (Playwright) and checks the layout contract: sidebar collapse/expand and width drag, crop dock collapse/expand and resize, main-canvas reflow with the Sun kept centered, CEA crop creation, crop wheel-zoom/drag-pan/reset, per-crop hide-on-disk, crop line analysis (freehand and bezier lines, band settings, strip/profile plots), and crop clearing. It starts a private backend on port 8766 and stops it afterwards, so it never interferes with a running instance on port 8765. It needs `pip install playwright` and a Chrome installation.
+## Line analysis (crop dock → Analysis tab)
 
-```powershell
-python tests\verify_ui.py
-```
+Click **+ Add line**, pick a source image layer, then a drawing mode:
 
-Exit code is `0` only when every check passes and the page reports no JavaScript errors. Screenshots from the run are written to `tests\shots\`. The layer-load step reuses `data\cache`; without cache it falls back to a live Helioviewer download and takes longer.
+- **Freehand** — hold and drag on the crop image; on release you can accept an optional smoothing pass.
+- **Bezier** — click anchor points, then shape the curve with each anchor's symmetric slope handles. Right-click deletes an anchor, Enter/Done finishes, and a saved bezier line can be re-edited later with its ✎ button.
 
-## CLI
+Each line gets a collapsible settings row:
 
-```powershell
-python -m litehelioviewer_app.cli load hmi-magnetogram --date 2013-02-15T12:00:00 --opacity 1
-python -m litehelioviewer_app.cli load aia-171 --date 2013-02-15T12:00:00 --opacity 0.35
-python -m litehelioviewer_app.cli fits path\to\sample.171.fits
-```
+- a **width** slider (km, logarithmic scale) and a **Gaussian σ** slider — the sampling weight across the line is `w(d) = exp(-d²/2σ²)` with `σ = s·W/2`, and `s = 0` gives a uniform band;
+- a live translucent band on the crop image that shows exactly which neighborhood is sampled;
+- a **Generate plot** button that renders a straightened RGB strip of the band plus an arc-length intensity profile (weighted mean of the layer luminance) beneath it.
 
-Data downloaded or generated by the app is stored under `data\` next to the app (created automatically on first run).
+## Roadmap
 
-Helioviewer layers use `getClosestImage` first, then download the matching JP2 with `getJP2Image`. Cache filenames include server, source id, preset, and the closest timestamp, for example:
+- Time-series visualization for CEA Patch regions anchored at fixed Carrington coordinates.
+- Natural-language, fuzzy-matched data download and plotting (agent control) — planned, not part of this release.
 
-```text
-hv_ias_sid10_aia-171_20130215_115959_sdo_aia_171_a.png
-hv_ias_sid10_aia-171_20130215_115959.jp2
-```
+## Requirements
 
-The manifest is stored at:
-
-```text
-G:\softwares\litehelioviewer\data\cache\manifest.json
-```
-
-When the same server, source, preset, and closest timestamp already exist in `data\cache`, LiteHelioviewer reuses the local JP2 and rendered PNG. The UI log will mark the layer as `cache`; otherwise it will mark it as `download`.
-
-## Current scope
-
-- Helioviewer JP2 download for SDO/HMI, SDO/AIA, SOHO/LASCO presets with nearest-frame cache naming.
-- JHelioviewer-derived default LUTs for AIA, LASCO C2/C3, and gray HMI.
-- Local FITS to PNG layer conversion with automatic AIA/LASCO LUT selection when metadata allows it.
-- Canvas-based orthographic sphere view with drag rotation, grid angle labels, reset view, layer opacity and visibility. The Stonyhurst grid uses the active layer's `CRLT_OBS`/B0 metadata so the grid, mouse coordinates, and CEA crop overlay share the same solar-axis geometry.
-- Trackball-style mouse rotation keeps the dragged solar surface point visually attached to the cursor.
-- Adaptive canvas render quality lowers the main-view backing resolution during drag/zoom/crop adjustment and restores the sharper view after interaction, reducing CPU Canvas stutter on high-DPI displays without changing layer data.
-- Lower-right coordinate readout shows mouse Stonyhurst and Carrington longitude/latitude when the cursor is on the disk.
-- Collapsible, drag-resizable control sidebar and a collapsible bottom crop dock; the main orthographic view reflows around both while keeping the Sun centered, with rotation/zoom behavior unchanged.
-- Manual CEA crop mode freezes globe rotation, lets the user drag two solar-surface endpoints, computes a local Carrington-centered CEA rectangle, and overlays it on the globe. Each crop opens in a tabbed bottom dock with km axes centered on 0; the crop view supports wheel zoom, drag pan, and one-click reset with live axis labels, and each crop region can be hidden on the disk, closed individually, or cleared all at once. In Crop mode, the active crop endpoints can be dragged to refine the selected region.
-- Crop line analysis: the crop dock's side panel switches between Info and Analysis tabs. In Analysis, "+ Add line" picks a source image layer and a drawing mode — freehand (with an optional smoothing pass on release) or point-by-point cubic Bezier with draggable symmetric slope handles, right-click anchor deletion, and later re-editing. Each line is stored on its crop in normalized coordinates, gets a collapsible settings row with a width (km, log scale) slider and a Gaussian soft-edge slider (w(d) = exp(-d^2/2σ^2), σ = s·W/2), and shows a live translucent band on the crop that visualizes the sampled neighborhood. "Generate plot" renders a straightened RGB strip of the band plus an arc-length intensity profile (weighted mean of the layer's luminance) beneath it.
-- LASCO C2/C3 layers use the JP2 header WCS fields (`CRPIX`, `CDELT`, `CRVAL`, `CROTA`) plus Helioviewer nearest-frame metadata and are rendered as a corona image plane tied to the solar globe, so they rotate with the view.
-- PFSS Model loads the nearest official PFSS FITS table from `https://swhv.oma.be/pfss/`, decodes `FIELDLINEx/y/z/s`, applies the JHelioviewer Earth-longitude rotation convention, and draws the real 3D field lines with red/blue polarity coloring.
-- Mouse-wheel zoom supports close inspection of the solar surface up to 6x.
-- Scrollable UI log panel for download status and errors.
-- Optional SAMP receiver for `image.load.fits` and simple `jhv.load.request` messages when a SAMP hub is present.
-- Agent skill draft in `agent-skill\litehelioviewer-control`.
-
-PFSS FITS and monthly `list.txt` files are cached under `data\cache\pfss`. The page log reports the requested time, nearest PFSS time, cache/download status, line count, and rotation angle used for each PFSS load.
+Python 3.9+ and the packages in `requirements.txt` (installed automatically on first run by the Windows launcher). `tests/verify_ui.py` contains an optional Playwright UI regression suite.
