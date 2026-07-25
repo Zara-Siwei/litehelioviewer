@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LiteHelioviewer</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/style.css?v=0.4.0" />
+  </head>
+  <body>
+    <aside class="panel" id="panel">
+      <div class="brand">
+        <div>
+          <h1>LiteHelioviewer</h1>
+          <p id="status">Ready</p>
+        </div>
+        <div class="brand-actions">
+          <button id="resetView" title="Reset view">Reset</button>
+          <button id="collapsePanel" title="Hide panel">&laquo;</button>
+        </div>
+      </div>
+
+      <section class="section">
+        <h2>New layer</h2>
+        <label>
+          Server
+          <select id="server"></select>
+        </label>
+        <label>
+          Data
+          <select id="preset"></select>
+        </label>
+        <label>
+          UTC time
+          <input id="date" type="datetime-local" step="1" />
+        </label>
+        <label>
+          Opacity
+          <input id="opacity" type="range" min="0" max="1" step="0.01" value="1" />
+        </label>
+        <button id="addLayer" class="primary">Add Helioviewer layer</button>
+      </section>
+
+      <section class="section row-actions">
+        <button id="openFits">Open FITS</button>
+        <button id="togglePfss">PFSS</button>
+        <button id="cropMode">Crop</button>
+        <button id="clearLayers">Clear</button>
+        <input id="fitsInput" type="file" accept=".fits,.fit,.fts" hidden />
+      </section>
+
+      <section class="section layers-section">
+        <h2>Layers</h2>
+        <div id="layers" class="layers"></div>
+      </section>
+
+      <section class="section log-section">
+        <div class="section-title-row">
+          <h2>Log</h2>
+          <button id="clearLog" title="Clear log">Clear</button>
+        </div>
+        <div id="logPanel" class="log-panel"></div>
+      </section>
+    </aside>
+
+    <div id="panelSplitter" class="panel-splitter" title="Drag to resize panel"></div>
+    <button id="expandPanel" class="panel-expand" title="Show panel" hidden>&raquo;</button>
+
+    <main class="workspace" id="workspace">
+      <div class="viewer" id="dropZone">
+        <canvas id="sun"></canvas>
+        <div class="hud">
+          <span>Orthographic</span>
+          <span id="viewReadout">lon 0.0 / lat 0.0</span>
+        </div>
+        <div id="coordReadout" class="coord-readout">Mouse: off disk</div>
+      </div>
+      <button id="showCropDock" class="crop-show" hidden>Crops</button>
+
+      <section id="cropDock" class="crop-dock" hidden>
+        <div id="cropResize" class="crop-resize" title="Drag to resize crop window"></div>
+        <div class="crop-head">
+          <div id="cropTabs" class="crop-tabs"></div>
+          <div class="crop-actions">
+            <button id="toggleCropRegion" title="Hide/show the active crop region on the solar disk">Hide region</button>
+            <button id="resetCropView" title="Reset crop zoom and pan">Reset</button>
+            <button id="hideCropDock" title="Collapse crop window">Collapse</button>
+            <button id="clearCrops" title="Clear CEA crops">Clear</button>
+          </div>
+        </div>
+        <div class="crop-body">
+          <canvas id="cropCanvas"></canvas>
+          <aside class="crop-side">
+            <div class="side-tabs">
+              <button id="sideTabInfo" class="side-tab active" type="button">Info</button>
+              <button id="sideTabAnalysis" class="side-tab" type="button">Analysis</button>
+            </div>
+            <div id="cropMeta" class="crop-meta"></div>
+            <div id="analysisPanel" class="analysis-panel" hidden>
+              <button id="addLineBtn" class="primary" type="button">+ Add line</button>
+              <div id="lineSetup" class="line-setup" hidden>
+                <label>
+                  Layer
+                  <select id="lineLayerSelect"></select>
+                </label>
+                <div class="line-setup-modes">
+                  <button id="lineModeFreehand" type="button">Freehand</button>
+                  <button id="lineModeBezier" type="button">Bezier</button>
+                </div>
+                <button id="lineSetupCancel" type="button">Cancel</button>
+              </div>
+              <div id="lineHint" class="line-hint" hidden>
+                <span id="lineHintText"></span>
+                <button id="lineHintDone" type="button" hidden>Done</button>
+              </div>
+              <div id="smoothPrompt" class="smooth-prompt" hidden>
+                <span>Smooth this line?</span>
+                <button id="smoothYes" type="button">Yes</button>
+                <button id="smoothNo" type="button">No</button>
+              </div>
+              <div id="lineList" class="line-list"></div>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=0.4.0"></script>
+  </body>
+</html>

@@ -1,0 +1,7 @@
+astropy
+fastapi
+numpy
+pillow
+python-multipart
+requests
+uvicorn

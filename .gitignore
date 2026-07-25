@@ -1,0 +1,19 @@
+# Runtime data: downloaded JP2/PNG cache, FITS uploads, logs
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test artifacts (screenshots)
+tests/shots/
+
+# Backups and temp files
+*.prev
+*.log
+
+# OS noise
+Thumbs.db
+.DS_Store
