@@ -2,7 +2,7 @@
 
 A lightweight local web viewer for Helioviewer solar images.
 
-This project stands on the shoulders of the mature [helioviewer.org](https://github.com/Helioviewer-Project/helioviewer.org) project — our foundation and data source. The original is excellent but a bit heavy for quick daily browsing, and it does not offer small patch-level tools, so LiteHelioviewer trims the everyday workflow (load recent SDO/HMI, AIA and LASCO frames, stack layers, rotate the solar disk) down to a tiny double-click local app, and adds the little things we missed: CEA Patch crops and crop line analysis. Everything runs locally except the image downloads themselves.
+This project stands on the shoulders of the mature [JHelioviewer-SWHV](https://github.com/Helioviewer-Project/JHelioviewer-SWHV) project — our foundation and reference. The original is excellent but a bit heavy for quick daily browsing, and it does not offer small patch-level tools, so LiteHelioviewer trims the everyday workflow (load recent SDO/HMI, AIA and LASCO frames, stack layers, rotate the solar disk) down to a tiny double-click local app, and adds the little things we missed: CEA Patch crops and crop line analysis. Everything runs locally except the image downloads themselves.
 
 ## Quick start
 
