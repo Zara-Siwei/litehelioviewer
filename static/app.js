@@ -436,6 +436,29 @@ function loadLayerImage(layer) {
   });
 }
 
+function layerFrameInfo(layer) {
+  const meta = layer.metadata || {};
+  const actual = meta.closest_date || meta.date || "";
+  const requested = meta.requestedDate || meta.requested_date || "";
+  const actualMs = Date.parse(actual);
+  const requestedMs = Date.parse(requested);
+  let deltaMin = null;
+  if (!Number.isNaN(actualMs) && !Number.isNaN(requestedMs)) {
+    deltaMin = Math.abs(actualMs - requestedMs) / 60000;
+  }
+  return { actual, requested, deltaMin, mismatch: deltaMin !== null && deltaMin > 20 };
+}
+
+function layerDateHtml(layer) {
+  const info = layerFrameInfo(layer);
+  if (!info.actual) return "";
+  const fmt = (value) => value.replace("T", " ").replace("Z", "").slice(0, 16);
+  if (info.mismatch) {
+    return `<div class="layer-date mismatch" title="Archive gap: this is the nearest available frame">⚠ ${escapeHtml(fmt(info.actual))} UTC (requested ${escapeHtml(fmt(info.requested))})</div>`;
+  }
+  return `<div class="layer-date">${escapeHtml(fmt(info.actual))} UTC</div>`;
+}
+
 function renderLayerList() {
   if (!layers.length) {
     layersEl.innerHTML = `<p>No layers yet</p>`;
@@ -448,6 +471,7 @@ function renderLayerList() {
         <div class="layer-name" title="${escapeHtml(layer.name)}">${escapeHtml(layer.name)}</div>
         <button data-action="delete" data-id="${layer.id}">X</button>
       </div>
+      ${layerDateHtml(layer)}
       <input type="range" min="0" max="1" step="0.01" value="${layer.opacity}" data-action="opacity" data-id="${layer.id}" />
     </div>
   `).join("");
@@ -494,6 +518,10 @@ async function addHelioviewerLayer() {
     const meta = result.layer?.metadata || {};
     const cacheText = meta.cache_hit ? "cache" : "download";
     appendLog(`Loaded ${result.layer?.name || presetEl.value}; closest=${meta.closest_date || meta.date}; server=${meta.server}; lut=${meta.lut || "Gray"}; ${cacheText}`, "ok");
+    const frame = layerFrameInfo(result.layer || {});
+    if (frame.mismatch) {
+      appendLog(`WARNING: archive gap — nearest ${result.layer?.name || presetEl.value} frame is ${frame.actual}, ${(frame.deltaMin / 60).toFixed(1)} h from the requested time; mixed-date layers will not align`, "error");
+    }
     if (meta.render_mode === "corona") {
       fitCoronaLayer(meta);
     }

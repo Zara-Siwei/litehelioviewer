@@ -114,6 +114,25 @@ def run() -> None:
         check("layer loaded", page.locator(".layer").count() >= 1)
         page.screenshot(path=str(SHOTS / "shot-03-layer.png"))
 
+        # 4a. Archive-gap frame (HMI @ 2011-02-14, cached) must show a mismatch
+        # date badge on the layer card and a log warning, then be removed again.
+        page.fill("#date", "2011-02-14T00:00")
+        page.click("#addLayer")
+        page.wait_for_function("document.getElementById('status').textContent.includes('Layer loaded')", timeout=90000)
+        page.wait_for_function("document.querySelectorAll('.layer').length >= 2", timeout=15000)
+        check("archive-gap layer added", page.locator(".layer").count() == 2)
+        check("layer date badges shown", page.locator(".layer-date").count() == 2,
+              f"count={page.locator('.layer-date').count()}")
+        check("archive-gap badge flagged", page.locator(".layer-date.mismatch").count() == 1,
+              f"count={page.locator('.layer-date.mismatch').count()}")
+        log_text = page.evaluate("document.getElementById('logPanel').textContent")
+        check("archive-gap warning logged", "archive gap" in log_text)
+        page.screenshot(path=str(SHOTS / "shot-03a-archive-gap.png"))
+        page.locator(".layer").nth(1).locator("button[data-action='delete']").click()
+        page.wait_for_function("document.querySelectorAll('.layer').length === 1", timeout=15000)
+        page.fill("#date", "2013-02-15T12:00")
+        page.wait_for_timeout(400)
+
         # 4b. Holding the mouse still must not blank the main canvas
         rect = page.evaluate("(() => { const r = document.getElementById('sun').getBoundingClientRect(); return {x: r.x, y: r.y, w: r.width, h: r.height}; })()")
         cx = rect["x"] + rect["w"] / 2

@@ -13,7 +13,14 @@ from pydantic import BaseModel
 from . import __version__
 from .config import DATA_DIR, STATIC_DIR, UPLOAD_DIR
 from .fits_utils import fits_to_png
-from .helioviewer import PRESETS, SERVERS, HelioviewerClient, normalize_date, server_fallback_order
+from .helioviewer import (
+    PRESETS,
+    SERVERS,
+    HelioviewerClient,
+    closest_delta_seconds,
+    normalize_date,
+    server_fallback_order,
+)
 from .pfss_utils import load_pfss
 from .samp_bridge import SampBridge
 from .state import store
@@ -29,6 +36,10 @@ app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 _samp_bridge: SampBridge | None = None
+
+# If the nearest archive frame is farther than this from the requested time,
+# skip the heavy JP2 download on that server and try the next one first.
+MAX_FRAME_GAP_SECONDS = 1200  # 20 minutes
 
 
 @app.middleware("http")
@@ -106,6 +117,7 @@ def load_helioviewer(request: HelioviewerLoad):
     if request.preset not in PRESETS:
         raise HTTPException(status_code=400, detail="Unknown preset")
     attempts = []
+    distant = []  # (delta_seconds, server, source_id) for archive-gap candidates
     image_path = None
     mapping = {}
     source_id = int(PRESETS[request.preset]["source_id"])
@@ -114,17 +126,42 @@ def load_helioviewer(request: HelioviewerLoad):
         try:
             client = HelioviewerClient(server)
             cached = client.get_cached_layer(source_id, request.date, request.preset)
-            if cached is None:
-                source_id = client.resolve_preset_source_id(request.preset)
-                image_path, mapping = client.fetch_jp2_layer(
-                    source_id=source_id,
-                    date=request.date,
-                    preset=request.preset,
-                )
-            else:
+            if cached is not None:
                 image_path, mapping = cached
+                used_server = server
+                break
+            server_source_id = client.resolve_preset_source_id(request.preset)
+            closest = client.get_closest_image(server_source_id, normalize_date(request.date))
+            delta = closest_delta_seconds(closest, request.date)
+            if delta is not None and delta > MAX_FRAME_GAP_SECONDS:
+                distant.append((delta, server, server_source_id))
+                attempts.append(
+                    f"{server}: nearest frame {closest.get('date')} is "
+                    f"{delta / 3600:.1f} h from the requested time"
+                )
+                continue
+            source_id = server_source_id
+            image_path, mapping = client.fetch_jp2_layer(
+                source_id=source_id,
+                date=request.date,
+                preset=request.preset,
+            )
             used_server = server
             break
+        except Exception as exc:
+            attempts.append(f"{server}: {exc}")
+    if image_path is None and distant:
+        # Every server only has a far-away frame: fall back to the closest one.
+        _, server, server_source_id = min(distant, key=lambda item: item[0])
+        try:
+            client = HelioviewerClient(server)
+            source_id = server_source_id
+            image_path, mapping = client.fetch_jp2_layer(
+                source_id=source_id,
+                date=request.date,
+                preset=request.preset,
+            )
+            used_server = server
         except Exception as exc:
             attempts.append(f"{server}: {exc}")
     if image_path is None:

@@ -419,6 +419,16 @@ def normalize_date(value: str) -> str:
     return f"{text}Z"
 
 
+def closest_delta_seconds(closest: dict[str, Any], requested_date: str) -> float | None:
+    """Absolute gap in seconds between the closest available frame and the request."""
+    try:
+        have = datetime.fromisoformat(normalize_api_date(str(closest.get("date") or "")).replace("Z", "+00:00"))
+        want = datetime.fromisoformat(normalize_date(requested_date).replace("Z", "+00:00"))
+        return abs((have - want).total_seconds())
+    except Exception:
+        return None
+
+
 def normalize_api_date(value: str) -> str:
     text = value.strip().replace(" ", "T")
     if not text.endswith("Z"):

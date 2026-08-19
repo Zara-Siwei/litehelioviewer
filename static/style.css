@@ -254,6 +254,17 @@ button.active {
   font-size: 13px;
 }
 
+.layer-date {
+  margin: -4px 0 8px;
+  font-size: 11px;
+  color: #7d8fa0;
+  font-family: Consolas, "Courier New", monospace;
+}
+
+.layer-date.mismatch {
+  color: #ffb14a;
+}
+
 .layer button {
   padding: 5px 8px;
 }

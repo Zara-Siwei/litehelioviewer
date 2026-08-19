@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $url = "http://127.0.0.1:8765"
-$version = "0.4.0"
+$version = "0.4.1"
 
 Set-Location $root
 $env:PYTHONIOENCODING = "utf-8"
