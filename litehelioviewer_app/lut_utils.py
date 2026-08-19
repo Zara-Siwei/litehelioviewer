@@ -8,8 +8,9 @@ import numpy as np
 
 from .config import ROOT
 
-JHV_ROOT = ROOT.parent / "JHelioviewer-SWHV"
-LUT_DIR = JHV_ROOT / "resources" / "luts"
+# Color tables are bundled with the app (assets/luts, courtesy of
+# JHelioviewer-SWHV) so a fresh clone works without any external checkout.
+LUT_DIR = ROOT / "assets" / "luts"
 COLORS_RULES = {
     "hmi-magnetogram": "Gray",
     "hmi-continuum": "Gray",
@@ -48,9 +49,22 @@ def apply_lut(indexed: np.ndarray, lut_name: str) -> np.ndarray:
 
 @lru_cache(maxsize=64)
 def load_lut(name: str) -> np.ndarray:
+    # A missing or unreadable color table must never break an image download;
+    # fall back to a plain gray ramp instead.
+    try:
+        return _load_lut(name)
+    except Exception:
+        return _gray_lut()
+
+
+def _gray_lut() -> np.ndarray:
+    ramp = np.arange(256, dtype=np.uint8)
+    return np.stack([ramp, ramp, ramp, np.full(256, 255, dtype=np.uint8)], axis=1)
+
+
+def _load_lut(name: str) -> np.ndarray:
     if name == "Gray":
-        ramp = np.arange(256, dtype=np.uint8)
-        return np.stack([ramp, ramp, ramp, np.full(256, 255, dtype=np.uint8)], axis=1)
+        return _gray_lut()
     if name.startswith("SDO-AIA "):
         match = re.search(r"(\d+)", name)
         if match:
