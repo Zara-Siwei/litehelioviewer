@@ -18,6 +18,7 @@ python start.py
 ## Features
 
 - Download layers through the Helioviewer API (SDO/HMI magnetogram and continuum, SDO/AIA channels, SOHO/LASCO C2/C3) with nearest-frame local caching; stack layers with per-layer opacity and visibility.
+- Archive gaps are made visible: for some dates the archive simply has no frames — e.g. there is no HMI magnetogram near 2011-02-14 00:00 UTC, so the nearest available frame (about a day later) is used instead. Each layer card shows the actual frame time, and frames far from the requested time are flagged with a ⚠ badge and a log warning.
 - Orthographic solar disk with a Stonyhurst grid: drag to rotate (trackball keeps the grabbed surface point under the cursor), mouse wheel to zoom.
 - Open local FITS files by drag and drop, and overlay PFSS magnetic field lines.
 - Collapsible, resizable sidebar and bottom crop dock; the main view reflows around them.
