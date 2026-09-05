@@ -437,6 +437,46 @@ def run() -> None:
         page.locator(".line-swatch").nth(0).click()
         page.wait_for_timeout(150)
 
+        # 8m. Line style, stroke width, and band visibility toggle
+        page.locator(".line-style-btn").nth(1).click()
+        page.wait_for_timeout(150)
+        check("line style set to dashed", page.evaluate("activeCrop().lines[0].stroke") == "dashed")
+        page.locator(".line-row .line-slider input[type=range]").nth(2).evaluate(
+            "el => { el.value = 4.0; el.dispatchEvent(new Event('input', { bubbles: true })); }"
+        )
+        page.wait_for_timeout(150)
+        check("stroke width slider updates", page.evaluate("activeCrop().lines[0].strokeWidth") == 4.0)
+        band_probe = (
+            "(() => { const reg = activeCrop(); const line = reg.lines[0];"
+            " const g = cropPlotGeometry(reg); const pts = linePixelPoints(reg, line);"
+            " const imgW = reg.image.width; const imgH = reg.image.height;"
+            " let mi = 0; let best = 1e9;"
+            " for (let i = 0; i < pts.length; i++) {"
+            "   const d = Math.hypot(pts[i].x - imgW / 2, pts[i].y - imgH / 2);"
+            "   if (d < best) { best = d; mi = i; }"
+            " }"
+            " const mid = pts[mi]; const n = polylineNormals(pts)[mi];"
+            " const sgn = ((imgW / 2 - mid.x) * n.x + (imgH / 2 - mid.y) * n.y) >= 0 ? 1 : -1;"
+            " const off = 12;"
+            " const ix = mid.x + n.x * off * sgn; const iy = mid.y + n.y * off * sgn;"
+            " const sx = Math.round(g.centerX + (ix - imgW / 2) * g.scale);"
+            " const sy = Math.round(g.centerY + (iy - imgH / 2) * g.scale);"
+            " const d = cropCtx.getImageData(sx, sy, 1, 1).data; return { r: d[0], g: d[1], b: d[2] }; })()"
+        )
+        tinted = page.evaluate(band_probe)
+        check("band tints the crop view", tinted["b"] - tinted["r"] > 15, str(tinted))
+        page.click(".line-band-toggle")
+        page.wait_for_timeout(300)
+        plain = page.evaluate(band_probe)
+        check("band hidden after toggle off",
+              plain["b"] - plain["r"] < tinted["b"] - tinted["r"] - 10, f"{tinted} -> {plain}")
+        check("band toggle state off", page.evaluate("activeCrop().lines[0].showBand") is False)
+        page.click(".line-band-toggle")
+        page.wait_for_timeout(300)
+        check("band toggle back on", page.evaluate("activeCrop().lines[0].showBand") is True)
+        page.locator(".line-style-btn").nth(0).click()
+        page.wait_for_timeout(150)
+
         # 9. Hide region on disk
         page.click("#toggleCropRegion")
         page.wait_for_timeout(300)

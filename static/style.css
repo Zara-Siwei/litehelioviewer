@@ -805,6 +805,76 @@ canvas {
   border-radius: 3px;
 }
 
+.line-style-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.line-style-group {
+  display: inline-flex;
+  border: 1px solid #2b3f52;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.line-style-btn {
+  padding: 5px 10px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+
+.line-style-btn + .line-style-btn {
+  border-left: 1px solid #2b3f52;
+}
+
+.line-style-btn:hover {
+  background: #182636;
+}
+
+.line-style-btn.active {
+  background: #1d2f42;
+}
+
+.line-style-icon {
+  display: block;
+  width: 26px;
+  height: 0;
+  border-top: 2px solid #cbd6e0;
+}
+
+.line-style-icon.dashed {
+  border-top-style: dashed;
+}
+
+.line-style-icon.dotted {
+  border-top-style: dotted;
+}
+
+.line-band-toggle {
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid #2b3f52;
+  background: transparent;
+  color: #74869a;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.line-band-toggle:hover {
+  border-color: #3f5a75;
+}
+
+.line-band-toggle.active {
+  background: #1d2f42;
+  color: #9fe3b0;
+  border-color: #3f5a75;
+}
+
 .line-plot {
   font-size: 12px;
   padding: 6px 8px;

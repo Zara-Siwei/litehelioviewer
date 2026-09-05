@@ -741,12 +741,13 @@ function exportCropImage(format) {
   octx.drawImage(region.imageCanvas, 0, 0);
   const lines = region.lines || [];
   for (const line of lines) {
+    if (line.showBand === false) continue;
     const band = lineBandCanvas(region, line);
     if (band) octx.drawImage(band, 0, 0);
   }
   octx.lineCap = "round";
   octx.lineJoin = "round";
-  const lineWidth = Math.max(1.5, w / 260);
+  const ls = Math.max(1.5, w / 260) / 1.8;
   for (const line of lines) {
     const pts = linePixelPoints(region, line);
     if (pts.length < 2) continue;
@@ -755,8 +756,10 @@ function exportCropImage(format) {
     for (let i = 1; i < pts.length; i++) octx.lineTo(pts[i].x, pts[i].y);
     octx.strokeStyle = line.color;
     octx.globalAlpha = 0.95;
-    octx.lineWidth = lineWidth;
+    octx.lineWidth = lineStrokePx(line, ls);
+    octx.setLineDash(lineStrokeDash(line, ls));
     octx.stroke();
+    octx.setLineDash([]);
     octx.globalAlpha = 1;
   }
   const ext = format === "jpg" ? "jpg" : "png";
@@ -1439,6 +1442,9 @@ function commitLineFromDraw(points, anchors) {
       points,
       anchors,
       color: LINE_COLORS[(number - 1) % LINE_COLORS.length],
+      stroke: "solid",
+      strokeWidth: 1.8,
+      showBand: true,
       widthKm: defaultLineWidthKm(region),
       softness: 0.5,
       collapsed: false,
@@ -1638,6 +1644,62 @@ function buildLineRow(region, line) {
   colorRow.appendChild(custom);
   body.appendChild(colorRow);
 
+  const styleRow = document.createElement("div");
+  styleRow.className = "line-style-row";
+  const styleGroup = document.createElement("div");
+  styleGroup.className = "line-style-group";
+  [["solid", "Solid"], ["dashed", "Dashed"], ["dotted", "Dotted"]].forEach(([value, label]) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `line-style-btn${(line.stroke || "solid") === value ? " active" : ""}`;
+    b.title = label;
+    const icon = document.createElement("span");
+    icon.className = `line-style-icon ${value}`;
+    b.appendChild(icon);
+    b.addEventListener("click", (event) => {
+      event.stopPropagation();
+      line.stroke = value;
+      renderAnalysisPanel();
+      renderCropCanvas();
+    });
+    styleGroup.appendChild(b);
+  });
+  styleRow.appendChild(styleGroup);
+  const bandToggle = document.createElement("button");
+  bandToggle.type = "button";
+  bandToggle.className = `line-band-toggle${line.showBand !== false ? " active" : ""}`;
+  bandToggle.textContent = "Band";
+  bandToggle.title = "Show/hide the translucent sampling band (off = plain line)";
+  bandToggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+    line.showBand = line.showBand === false;
+    renderAnalysisPanel();
+    renderCropCanvas();
+  });
+  styleRow.appendChild(bandToggle);
+  body.appendChild(styleRow);
+
+  const strokeLabel = document.createElement("label");
+  strokeLabel.className = "line-slider";
+  const strokeText = document.createElement("span");
+  strokeText.textContent = "Stroke";
+  const strokeVal = document.createElement("span");
+  strokeVal.className = "line-slider-val";
+  strokeVal.textContent = `${(line.strokeWidth || 1.8).toFixed(1)} px`;
+  const strokeInput = document.createElement("input");
+  strokeInput.type = "range";
+  strokeInput.min = "0.6";
+  strokeInput.max = "6";
+  strokeInput.step = "0.2";
+  strokeInput.value = String(line.strokeWidth || 1.8);
+  strokeInput.addEventListener("input", () => {
+    line.strokeWidth = Number(strokeInput.value);
+    strokeVal.textContent = `${line.strokeWidth.toFixed(1)} px`;
+    renderCropCanvas();
+  });
+  strokeLabel.append(strokeText, strokeVal, strokeInput);
+  body.appendChild(strokeLabel);
+
   const plotBtn = document.createElement("button");
   plotBtn.type = "button";
   plotBtn.className = "line-plot";
@@ -1776,6 +1838,18 @@ function hexToRgb(hex) {
   return { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) };
 }
 
+// Dash pattern per line style; `ls` is the display scale (screen pxU or the
+// export-canvas equivalent), so dashes look identical in the UI and exports.
+function lineStrokeDash(line, ls) {
+  if (line.stroke === "dashed") return [6 * ls, 4 * ls];
+  if (line.stroke === "dotted") return [0.02 * ls, 2.6 * ls];
+  return [];
+}
+
+function lineStrokePx(line, ls) {
+  return Math.max(1.0, (line.strokeWidth || 1.8) * ls);
+}
+
 function lineBandCanvas(region, line) {
   const imgW = region.image.width;
   const imgH = region.image.height;
@@ -1878,6 +1952,7 @@ function drawCropLines(region, g) {
   const bx0 = g.centerX - drawW * 0.5;
   const by0 = g.centerY - drawH * 0.5;
   for (const line of lines) {
+    if (line.showBand === false) continue;
     const band = lineBandCanvas(region, line);
     if (band) cropCtx.drawImage(band, bx0, by0, drawW, drawH);
   }
@@ -1896,8 +1971,10 @@ function drawCropLines(region, g) {
     }
     cropCtx.strokeStyle = line.color;
     cropCtx.globalAlpha = editingThis ? 0.55 : 0.95;
-    cropCtx.lineWidth = Math.max(1.4, 1.8 * pxU);
+    cropCtx.lineWidth = lineStrokePx(line, pxU);
+    cropCtx.setLineDash(lineStrokeDash(line, pxU));
     cropCtx.stroke();
+    cropCtx.setLineDash([]);
     cropCtx.globalAlpha = 1;
   }
   if (drawActive) {

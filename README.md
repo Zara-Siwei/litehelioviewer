@@ -45,6 +45,7 @@ Each line gets a collapsible settings row:
 - a **width** slider (km, logarithmic scale) and a **Gaussian σ** slider — the sampling weight across the line is `w(d) = exp(-d²/2σ²)` with `σ = s·W/2`, and `s = 0` gives a uniform band;
 - a live translucent band on the crop image that shows exactly which neighborhood is sampled (the band ends in rounded capsule caps that follow the same weight falloff);
 - a color palette with preset swatches plus a custom color picker;
+- a line style selector (**solid / dashed / dotted**), a stroke-width slider for the line itself, and a **Band** toggle that shows or hides the translucent sampling band (off = a plain line);
 - a **Generate plot** button that renders a straightened RGB strip of the band plus an arc-length intensity profile (weighted mean of the layer luminance) beneath it.
 
 Lines are anchored in Carrington coordinates, so dragging a crop's A/B endpoints only moves the viewing window — the line stays fixed on the Sun. Each crop keeps its own set of lines.
