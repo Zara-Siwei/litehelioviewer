@@ -718,7 +718,7 @@ function exportFileName(region, ext) {
   const meta = firstVisibleImageMetadata();
   const helio = meta?.heliographic || {};
   const raw = String(helio.date_obs || meta?.closest_date || meta?.date || "");
-  const stamp = raw.replace("T", "_").replace(/:/g, "").replace(/Z$/, "").slice(0, 16);
+  const stamp = raw.replace("T", "_").replace(/:/g, "").replace(/\.\d+(Z)?$/, "$1").replace(/Z$/, "");
   const base = region.name.replace(/\s+/g, "-");
   return stamp ? `${base}_${stamp}.${ext}` : `${base}.${ext}`;
 }

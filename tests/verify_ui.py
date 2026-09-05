@@ -12,6 +12,7 @@ falls back to a live Helioviewer download and may take longer.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import time
@@ -319,6 +320,8 @@ def run() -> None:
         png_path = SHOTS / download.suggested_filename
         download.save_as(str(png_path))
         check("export filename is png", download.suggested_filename.endswith(".png"), download.suggested_filename)
+        stamp_ok = re.match(r"^CEA-Patch-1_2013-02-15_\d{6}\.png$", download.suggested_filename) is not None
+        check("export filename uses observation time", stamp_ok, download.suggested_filename)
         try:
             from PIL import Image
             with Image.open(png_path) as im:
