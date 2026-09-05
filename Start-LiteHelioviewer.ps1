@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $url = "http://127.0.0.1:8765"
-$version = "0.4.11"
+$version = "0.4.12"
 
 Set-Location $root
 $env:PYTHONIOENCODING = "utf-8"
@@ -37,7 +37,7 @@ if (-not $python) {
     exit 1
 }
 
-& $python -c "import fastapi, uvicorn, astropy, PIL, requests, numpy, multipart" 2>$null
+& $python -c "import fastapi, uvicorn, astropy, PIL, requests, numpy, multipart, websockets" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Installing Python requirements (first run only)..."
     & $python -m pip install -r (Join-Path $root "requirements.txt")
