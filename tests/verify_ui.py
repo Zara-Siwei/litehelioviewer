@@ -614,6 +614,11 @@ def run() -> None:
             page2.wait_for_timeout(6000)
             check("autostop backend alive while tab open", auto_proc.poll() is None)
 
+            # a goodbye beacon followed by heartbeats (the reload case) must not stop the backend
+            page2.evaluate("navigator.sendBeacon('/api/goodbye')")
+            page2.wait_for_timeout(6000)  # beyond the goodbye grace window
+            check("goodbye beacon cancelled by live heartbeats", auto_proc.poll() is None)
+
             page2.close()
             deadline = time.time() + 20
             while time.time() < deadline and auto_proc.poll() is None:

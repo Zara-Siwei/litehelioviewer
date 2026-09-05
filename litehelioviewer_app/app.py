@@ -42,15 +42,34 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 _samp_bridge: SampBridge | None = None
 
 # --- Browser-presence watchdog -------------------------------------------
-# The UI POSTs /api/heartbeat every few seconds while a browser tab is open.
-# Once at least one heartbeat has been seen, losing it for longer than
-# LHV_AUTOSTOP_SECONDS (default 60) means the browser is gone, and this
-# local backend shuts itself down so the launcher console closes with it.
+# The UI POSTs /api/heartbeat every few seconds while a browser tab is open,
+# and sends a /api/goodbye beacon the moment a tab closes or navigates away.
+#   - goodbye beacon: if no heartbeat returns within _GOODBYE_GRACE seconds,
+#     the browser is really gone (a page reload restores the heartbeat first)
+#   - heartbeat timeout: fallback for crashes / lost beacons
+# On either trigger the backend exits, closing the launcher console with it.
 # Pure API/CLI usage never sends a heartbeat, so it is never auto-stopped.
 # Set LHV_NO_AUTOSTOP=1 to disable the watchdog entirely.
-_AUTOSTOP_SECONDS = float(os.environ.get("LHV_AUTOSTOP_SECONDS", "60"))
+_AUTOSTOP_SECONDS = float(os.environ.get("LHV_AUTOSTOP_SECONDS", "15"))
+_GOODBYE_GRACE = min(8.0, _AUTOSTOP_SECONDS)
 _heartbeat_lock = threading.Lock()
 _heartbeat_last: float | None = None  # monotonic time of the last heartbeat
+_goodbye_at: float | None = None      # monotonic time of the last goodbye
+
+
+def _shutdown(reason: str) -> None:
+    # Final grace: a just-woken or just-reloaded browser gets one last chance.
+    time.sleep(2.0)
+    with _heartbeat_lock:
+        last = _heartbeat_last
+        goodbye = _goodbye_at
+    now = time.monotonic()
+    still_overdue = last is not None and now - last > _AUTOSTOP_SECONDS
+    still_goodbye = goodbye is not None and now - goodbye > _GOODBYE_GRACE
+    if not (still_overdue or still_goodbye):
+        return  # a heartbeat arrived during the grace window; stay alive
+    print(f"{reason}; LiteHelioviewer is shutting down.", flush=True)
+    os._exit(0)
 
 
 def _watchdog_loop() -> None:
@@ -59,15 +78,14 @@ def _watchdog_loop() -> None:
         time.sleep(interval)
         with _heartbeat_lock:
             last = _heartbeat_last
+            goodbye = _goodbye_at
         if last is None:
             continue  # browser never connected: stay alive for API/CLI use
-        if time.monotonic() - last > _AUTOSTOP_SECONDS:
-            print(
-                f"Browser closed (no heartbeat for {_AUTOSTOP_SECONDS:.0f}s); "
-                "LiteHelioviewer is shutting down.",
-                flush=True,
-            )
-            os._exit(0)
+        now = time.monotonic()
+        if goodbye is not None and now - goodbye > _GOODBYE_GRACE:
+            _shutdown("Browser closed")
+        elif now - last > _AUTOSTOP_SECONDS:
+            _shutdown(f"Browser closed (no heartbeat for {_AUTOSTOP_SECONDS:.0f}s)")
 
 
 def _start_watchdog() -> None:
@@ -76,7 +94,8 @@ def _start_watchdog() -> None:
 
     class _HeartbeatAccessFilter(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
-            return "/api/heartbeat" not in record.getMessage()
+            msg = record.getMessage()
+            return "/api/heartbeat" not in msg and "/api/goodbye" not in msg
 
     logging.getLogger("uvicorn.access").addFilter(_HeartbeatAccessFilter())
     threading.Thread(target=_watchdog_loop, daemon=True).start()
@@ -129,9 +148,19 @@ def health():
 
 @app.post("/api/heartbeat")
 def heartbeat():
-    global _heartbeat_last
+    global _heartbeat_last, _goodbye_at
     with _heartbeat_lock:
         _heartbeat_last = time.monotonic()
+        _goodbye_at = None  # a live tab cancels any pending goodbye shutdown
+    return {"ok": True}
+
+
+@app.post("/api/goodbye")
+def goodbye():
+    global _goodbye_at
+    with _heartbeat_lock:
+        if _heartbeat_last is not None:  # only meaningful after a tab connected
+            _goodbye_at = time.monotonic()
     return {"ok": True}
 
 

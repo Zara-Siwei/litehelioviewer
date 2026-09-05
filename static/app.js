@@ -46,12 +46,19 @@ const cropExport = document.getElementById("cropExport");
 const cropExportBtn = document.getElementById("cropExportBtn");
 const cropExportMenu = document.getElementById("cropExportMenu");
 
-// Tell the backend a browser tab is still open. Once a heartbeat has been
-// seen, the server shuts itself down shortly after the last tab disappears,
-// so closing the browser also closes the launcher console window.
-setInterval(() => {
+// Tell the backend a browser tab is still open: one heartbeat immediately,
+// then every 5 s. When the tab closes or navigates away we send a goodbye
+// beacon; the backend shuts down a few seconds later unless a heartbeat
+// returns (e.g. a page reload), so closing the browser also closes the
+// launcher console window.
+function sendHeartbeat() {
   fetch("/api/heartbeat", { method: "POST" }).catch(() => {});
-}, 5000);
+}
+sendHeartbeat();
+setInterval(sendHeartbeat, 5000);
+window.addEventListener("pagehide", () => {
+  navigator.sendBeacon("/api/goodbye");
+});
 
 let layers = [];
 let imageCache = new Map();
