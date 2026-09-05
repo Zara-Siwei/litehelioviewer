@@ -1841,8 +1841,8 @@ function hexToRgb(hex) {
 // Dash pattern per line style; `ls` is the display scale (screen pxU or the
 // export-canvas equivalent), so dashes look identical in the UI and exports.
 function lineStrokeDash(line, ls) {
-  if (line.stroke === "dashed") return [6 * ls, 4 * ls];
-  if (line.stroke === "dotted") return [0.02 * ls, 2.6 * ls];
+  if (line.stroke === "dashed") return [10 * ls, 7 * ls];
+  if (line.stroke === "dotted") return [0.02 * ls, 5 * ls];
   return [];
 }
 
