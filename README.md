@@ -15,7 +15,7 @@ pip install -r requirements.txt
 python start.py
 ```
 
-The backend watches the browser over a WebSocket: the socket drops the instant the last tab closes, and the server shuts itself down within seconds (the launcher console window closes with it). A page reload reconnects inside the grace window, and a background tab keeps its socket, so neither stops the backend. Closing the console window also stops everything. Pure API/CLI use without a browser is never auto-stopped; set `LHV_NO_AUTOSTOP=1` to disable the watchdog, or `LHV_AUTOSTOP_SECONDS` to change the 8-second reconnect grace.
+The backend watches the browser over a WebSocket: the socket drops the instant the last tab closes, and the server shuts itself down within seconds (the launcher console window closes with it). A page reload reconnects inside the grace window, and a background tab keeps its socket, so neither stops the backend. Closing the console window also stops everything. Pure API/CLI use without a browser is never auto-stopped; set `LHV_NO_AUTOSTOP=1` to disable the watchdog, or `LHV_AUTOSTOP_SECONDS` to change the 3-second reconnect grace.
 
 ## Features
 

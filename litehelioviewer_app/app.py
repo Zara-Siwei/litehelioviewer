@@ -42,13 +42,13 @@ _samp_bridge: SampBridge | None = None
 
 # --- Browser-presence watchdog -------------------------------------------
 # The UI keeps a WebSocket to /ws open while a tab is alive. When the last
-# connection drops and none returns within LHV_AUTOSTOP_SECONDS (default 8),
+# connection drops and none returns within LHV_AUTOSTOP_SECONDS (default 3),
 # the browser is gone and this local backend exits, closing the launcher
 # console window with it. A page reload reconnects within the grace window,
 # and a hidden/background tab keeps its socket, so neither is mistaken for
 # a closed browser. Pure API/CLI use never opens a socket and is therefore
 # never auto-stopped. Set LHV_NO_AUTOSTOP=1 to disable the watchdog.
-_AUTOSTOP_SECONDS = float(os.environ.get("LHV_AUTOSTOP_SECONDS", "8"))
+_AUTOSTOP_SECONDS = float(os.environ.get("LHV_AUTOSTOP_SECONDS", "3"))
 _presence_lock = threading.Lock()
 _ws_connections = 0
 _ws_ever_connected = False
