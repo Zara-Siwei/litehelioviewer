@@ -46,19 +46,17 @@ const cropExport = document.getElementById("cropExport");
 const cropExportBtn = document.getElementById("cropExportBtn");
 const cropExportMenu = document.getElementById("cropExportMenu");
 
-// Tell the backend a browser tab is still open: one heartbeat immediately,
-// then every 5 s. When the tab closes or navigates away we send a goodbye
-// beacon; the backend shuts down a few seconds later unless a heartbeat
-// returns (e.g. a page reload), so closing the browser also closes the
-// launcher console window.
-function sendHeartbeat() {
-  fetch("/api/heartbeat", { method: "POST" }).catch(() => {});
+// Keep a WebSocket to the backend while this tab is alive: the socket
+// existing is the presence signal, and closing the tab drops it instantly,
+// so the backend shuts itself down within seconds and the launcher console
+// closes with it. A page reload reconnects inside the grace window, a
+// background tab keeps its socket, and an unexpected drop retries.
+function connectPresence() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onclose = () => setTimeout(connectPresence, 1000);
 }
-sendHeartbeat();
-setInterval(sendHeartbeat, 5000);
-window.addEventListener("pagehide", () => {
-  navigator.sendBeacon("/api/goodbye");
-});
+connectPresence();
 
 let layers = [];
 let imageCache = new Map();

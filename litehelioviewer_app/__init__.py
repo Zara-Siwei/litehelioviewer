@@ -1,3 +1,3 @@
 """LiteHelioviewer local web application."""
 
-__version__ = "0.4.8"
+__version__ = "0.4.9"

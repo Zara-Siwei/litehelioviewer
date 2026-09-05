@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import threading
@@ -8,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,62 +41,52 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 _samp_bridge: SampBridge | None = None
 
 # --- Browser-presence watchdog -------------------------------------------
-# The UI POSTs /api/heartbeat every few seconds while a browser tab is open,
-# and sends a /api/goodbye beacon the moment a tab closes or navigates away.
-#   - goodbye beacon: if no heartbeat returns within _GOODBYE_GRACE seconds,
-#     the browser is really gone (a page reload restores the heartbeat first)
-#   - heartbeat timeout: fallback for crashes / lost beacons
-# On either trigger the backend exits, closing the launcher console with it.
-# Pure API/CLI usage never sends a heartbeat, so it is never auto-stopped.
-# Set LHV_NO_AUTOSTOP=1 to disable the watchdog entirely.
-_AUTOSTOP_SECONDS = float(os.environ.get("LHV_AUTOSTOP_SECONDS", "15"))
-_GOODBYE_GRACE = min(8.0, _AUTOSTOP_SECONDS)
-_heartbeat_lock = threading.Lock()
-_heartbeat_last: float | None = None  # monotonic time of the last heartbeat
-_goodbye_at: float | None = None      # monotonic time of the last goodbye
+# The UI keeps a WebSocket to /ws open while a tab is alive. When the last
+# connection drops and none returns within LHV_AUTOSTOP_SECONDS (default 8),
+# the browser is gone and this local backend exits, closing the launcher
+# console window with it. A page reload reconnects within the grace window,
+# and a hidden/background tab keeps its socket, so neither is mistaken for
+# a closed browser. Pure API/CLI use never opens a socket and is therefore
+# never auto-stopped. Set LHV_NO_AUTOSTOP=1 to disable the watchdog.
+_AUTOSTOP_SECONDS = float(os.environ.get("LHV_AUTOSTOP_SECONDS", "8"))
+_presence_lock = threading.Lock()
+_ws_connections = 0
+_ws_ever_connected = False
 
 
 def _shutdown(reason: str) -> None:
-    # Final grace: a just-woken or just-reloaded browser gets one last chance.
+    # Final grace: a reloading or just-woken browser gets one last chance.
     time.sleep(2.0)
-    with _heartbeat_lock:
-        last = _heartbeat_last
-        goodbye = _goodbye_at
-    now = time.monotonic()
-    still_overdue = last is not None and now - last > _AUTOSTOP_SECONDS
-    still_goodbye = goodbye is not None and now - goodbye > _GOODBYE_GRACE
-    if not (still_overdue or still_goodbye):
-        return  # a heartbeat arrived during the grace window; stay alive
+    with _presence_lock:
+        connected = _ws_connections
+    if connected > 0:
+        return  # reconnected during the grace window; stay alive
     print(f"{reason}; LiteHelioviewer is shutting down.", flush=True)
     os._exit(0)
 
 
 def _watchdog_loop() -> None:
-    interval = max(1.0, min(5.0, _AUTOSTOP_SECONDS / 4))
+    interval = max(0.5, min(2.0, _AUTOSTOP_SECONDS / 4))
+    zero_since: float | None = None
     while True:
         time.sleep(interval)
-        with _heartbeat_lock:
-            last = _heartbeat_last
-            goodbye = _goodbye_at
-        if last is None:
-            continue  # browser never connected: stay alive for API/CLI use
-        now = time.monotonic()
-        if goodbye is not None and now - goodbye > _GOODBYE_GRACE:
+        with _presence_lock:
+            connected = _ws_connections
+            ever = _ws_ever_connected
+        if not ever:
+            continue  # no browser yet: stay alive for API/CLI use
+        if connected > 0:
+            zero_since = None
+            continue
+        if zero_since is None:
+            zero_since = time.monotonic()
+        elif time.monotonic() - zero_since > _AUTOSTOP_SECONDS:
             _shutdown("Browser closed")
-        elif now - last > _AUTOSTOP_SECONDS:
-            _shutdown(f"Browser closed (no heartbeat for {_AUTOSTOP_SECONDS:.0f}s)")
 
 
 def _start_watchdog() -> None:
     if os.environ.get("LHV_NO_AUTOSTOP"):
         return
-
-    class _HeartbeatAccessFilter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:
-            msg = record.getMessage()
-            return "/api/heartbeat" not in msg and "/api/goodbye" not in msg
-
-    logging.getLogger("uvicorn.access").addFilter(_HeartbeatAccessFilter())
     threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 
@@ -146,22 +135,23 @@ def health():
     return {"ok": True, "name": "LiteHelioviewer", "version": __version__, "layers": len(store.layers)}
 
 
-@app.post("/api/heartbeat")
-def heartbeat():
-    global _heartbeat_last, _goodbye_at
-    with _heartbeat_lock:
-        _heartbeat_last = time.monotonic()
-        _goodbye_at = None  # a live tab cancels any pending goodbye shutdown
-    return {"ok": True}
-
-
-@app.post("/api/goodbye")
-def goodbye():
-    global _goodbye_at
-    with _heartbeat_lock:
-        if _heartbeat_last is not None:  # only meaningful after a tab connected
-            _goodbye_at = time.monotonic()
-    return {"ok": True}
+@app.websocket("/ws")
+async def presence_socket(websocket: WebSocket):
+    # One connection per open tab; the client never sends anything - the
+    # socket existing is the presence signal, and its drop is instant notice.
+    global _ws_connections, _ws_ever_connected
+    await websocket.accept()
+    with _presence_lock:
+        _ws_connections += 1
+        _ws_ever_connected = True
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        with _presence_lock:
+            _ws_connections -= 1
 
 
 @app.get("/api/layers")

@@ -609,15 +609,13 @@ def run() -> None:
 
             page2 = browser.new_page()
             page2.goto(auto_url, wait_until="domcontentloaded")
-            # heartbeat faster than the 4 s watchdog timeout
-            page2.evaluate("setInterval(() => fetch('/api/heartbeat', { method: 'POST' }).catch(() => {}), 400)")
-            page2.wait_for_timeout(6000)
+            page2.wait_for_timeout(4000)  # presence socket connected
             check("autostop backend alive while tab open", auto_proc.poll() is None)
 
-            # a goodbye beacon followed by heartbeats (the reload case) must not stop the backend
-            page2.evaluate("navigator.sendBeacon('/api/goodbye')")
-            page2.wait_for_timeout(6000)  # beyond the goodbye grace window
-            check("goodbye beacon cancelled by live heartbeats", auto_proc.poll() is None)
+            # a reload drops and reopens the socket within the grace window
+            page2.reload(wait_until="domcontentloaded")
+            page2.wait_for_timeout(6000)  # beyond the 4 s grace: must stay alive
+            check("backend survives page reload", auto_proc.poll() is None)
 
             page2.close()
             deadline = time.time() + 20
