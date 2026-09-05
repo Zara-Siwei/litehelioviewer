@@ -758,6 +758,53 @@ canvas {
   line-height: 1.35;
 }
 
+.line-colors {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.line-swatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  outline: 1px solid rgba(255, 255, 255, 0.14);
+  padding: 0;
+  cursor: pointer;
+  transition: transform 0.12s ease, border-color 0.12s ease;
+}
+
+.line-swatch:hover {
+  transform: scale(1.15);
+}
+
+.line-swatch.active {
+  border-color: #eef6fc;
+  outline-color: transparent;
+  box-shadow: 0 0 0 2px rgba(238, 246, 252, 0.35);
+}
+
+.line-color-custom {
+  width: 26px;
+  height: 18px;
+  padding: 0;
+  border: 1px dashed #3f5a75;
+  border-radius: 5px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.line-color-custom::-webkit-color-swatch-wrapper {
+  padding: 1px;
+}
+
+.line-color-custom::-webkit-color-swatch {
+  border: 0;
+  border-radius: 3px;
+}
+
 .line-plot {
   font-size: 12px;
   padding: 6px 8px;

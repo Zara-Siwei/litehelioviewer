@@ -71,6 +71,7 @@ let lineDraw = null;
 let plotRegenTimer = null;
 
 const LINE_COLORS = ["#4aa3ff", "#7effac", "#ffb14a", "#ff7ad9", "#8f7aff", "#4affe3"];
+const LINE_COLOR_CHOICES = [...LINE_COLORS, "#ff5c5c", "#ffe74a", "#eef6fc", "#9fb2c2"];
 
 const SOLAR_RADIUS_KM = 695700;
 const AU_KM = 149597870.7;
@@ -1614,6 +1615,29 @@ function buildLineRow(region, line) {
   note.textContent = "weight w(d) = exp(-d²/2σ²), σ = s·W/2; s = 0 gives a uniform band";
   body.appendChild(note);
 
+  const colorRow = document.createElement("div");
+  colorRow.className = "line-colors";
+  LINE_COLOR_CHOICES.forEach((choice) => {
+    const sw = document.createElement("button");
+    sw.type = "button";
+    sw.className = `line-swatch${line.color.toLowerCase() === choice.toLowerCase() ? " active" : ""}`;
+    sw.style.background = choice;
+    sw.title = choice;
+    sw.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setLineColor(region, line, choice);
+    });
+    colorRow.appendChild(sw);
+  });
+  const custom = document.createElement("input");
+  custom.type = "color";
+  custom.className = "line-color-custom";
+  custom.value = /^#[0-9a-f]{6}$/i.test(line.color) ? line.color : "#4aa3ff";
+  custom.title = "Custom color";
+  custom.addEventListener("input", () => setLineColor(region, line, custom.value));
+  colorRow.appendChild(custom);
+  body.appendChild(colorRow);
+
   const plotBtn = document.createElement("button");
   plotBtn.type = "button";
   plotBtn.className = "line-plot";
@@ -1643,6 +1667,16 @@ function buildLineRow(region, line) {
   body.append(strip, chart);
   row.appendChild(body);
   return row;
+}
+
+function setLineColor(region, line, color) {
+  line.color = color;
+  line.bandCanvas = null;
+  line.bandKey = null;
+  renderAnalysisPanel();
+  renderCropCanvas();
+  schedulePlotRegen(region, line);
+  appendLog(`${line.name} color set to ${color}`);
 }
 
 function deleteLine(region, line) {
@@ -1747,7 +1781,7 @@ function lineBandCanvas(region, line) {
   const imgH = region.image.height;
   const last = line.points[line.points.length - 1];
   const key = [
-    line.widthKm.toFixed(1), line.softness, imgW, imgH, line.points.length, last?.x, last?.y,
+    line.widthKm.toFixed(1), line.softness, line.color, imgW, imgH, line.points.length, last?.x, last?.y,
     region.bounds.xMin.toFixed(4), region.bounds.xMax.toFixed(4),
     region.bounds.yMin.toFixed(4), region.bounds.yMax.toFixed(4),
     region.frame.center.x.toFixed(5), region.frame.center.y.toFixed(5), region.frame.center.z.toFixed(5),
@@ -1779,6 +1813,36 @@ function lineBandCanvas(region, line) {
         bctx.moveTo(inner[0].x, inner[0].y);
         for (let i = 1; i < inner.length; i++) bctx.lineTo(inner[i].x, inner[i].y);
         for (let i = outer.length - 1; i >= 0; i--) bctx.lineTo(outer[i].x, outer[i].y);
+        bctx.closePath();
+        bctx.fillStyle = `rgba(${color.r},${color.g},${color.b},${alpha.toFixed(3)})`;
+        bctx.fill();
+      }
+    }
+    // Rounded caps: the same weight rings continued as half-annuli around each
+    // endpoint, so the band ends in a capsule shape instead of a flat cut.
+    const lastIdx = pts.length - 1;
+    const capEnds = [
+      { p: pts[0], n: normals[0], out: { x: pts[0].x - pts[1].x, y: pts[0].y - pts[1].y } },
+      { p: pts[lastIdx], n: normals[lastIdx], out: { x: pts[lastIdx].x - pts[lastIdx - 1].x, y: pts[lastIdx].y - pts[lastIdx - 1].y } },
+    ];
+    for (const cap of capEnds) {
+      const outLen = Math.hypot(cap.out.x, cap.out.y);
+      if (outLen < 1e-9) continue;
+      const ux = cap.out.x / outLen;
+      const uy = cap.out.y / outLen;
+      const kmPerPx = Math.hypot(cap.n.x * kx, cap.n.y * ky) || (kx + ky) * 0.5;
+      const phi = Math.atan2(uy, ux);
+      for (let j = 1; j <= LAYERS; j++) {
+        const d0 = ((j - 1) / LAYERS) * halfKm;
+        const d1 = (j / LAYERS) * halfKm;
+        const w = (lineWeight(d0, halfKm, line.softness) + lineWeight(d1, halfKm, line.softness)) * 0.5;
+        const alpha = 0.38 * w;
+        if (alpha < 0.004) continue;
+        const r0 = Math.max(0.001, d0 / kmPerPx);
+        const r1 = Math.max(0.0015, d1 / kmPerPx);
+        bctx.beginPath();
+        bctx.arc(cap.p.x, cap.p.y, r1, phi - Math.PI / 2, phi + Math.PI / 2, false);
+        bctx.arc(cap.p.x, cap.p.y, r0, phi + Math.PI / 2, phi - Math.PI / 2, true);
         bctx.closePath();
         bctx.fillStyle = `rgba(${color.r},${color.g},${color.b},${alpha.toFixed(3)})`;
         bctx.fill();

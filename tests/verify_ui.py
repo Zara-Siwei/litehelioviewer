@@ -377,6 +377,63 @@ def run() -> None:
         check("line shifts within the moved window", norm_after != norm_before)
         page.screenshot(path=str(SHOTS / "shot-08e-line-anchored.png"))
 
+        # 8k. Sampling band ends are rounded capsules, weight falloff continued
+        cap = page.evaluate(
+            "(() => {"
+            " const reg = activeCrop();"
+            " const probe = {"
+            "   points: [{ x: reg.center.lon - 2, y: reg.center.lat }, { x: reg.center.lon + 2, y: reg.center.lat }],"
+            "   widthKm: reg.size.widthKm * 0.3, softness: 0.8, color: '#ffffff'"
+            " };"
+            " const band = lineBandCanvas(reg, probe);"
+            " const ctx = band.getContext('2d');"
+            " const pts = linePixelPoints(reg, probe);"
+            " const normals = polylineNormals(pts);"
+            " const p0 = pts[0]; const p1 = pts[1];"
+            " const ol = Math.hypot(p0.x - p1.x, p0.y - p1.y);"
+            " const ux = (p0.x - p1.x) / ol; const uy = (p0.y - p1.y) / ol;"
+            " const kx = reg.size.widthKm / reg.image.width;"
+            " const ky = reg.size.heightKm / reg.image.height;"
+            " const n = normals[0];"
+            " const kmPerPx = Math.hypot(n.x * kx, n.y * ky) || (kx + ky) * 0.5;"
+            " const halfPx = (probe.widthKm / 2) / kmPerPx;"
+            " const at = (f) => {"
+            "   const x = Math.round(p0.x + ux * halfPx * f);"
+            "   const y = Math.round(p0.y + uy * halfPx * f);"
+            "   if (x < 0 || y < 0 || x >= band.width || y >= band.height) return -1;"
+            "   return ctx.getImageData(x, y, 1, 1).data[3];"
+            " };"
+            " return { inside: at(0.75), outside: at(1.3), p0x: p0.x, p0y: p0.y, halfPx };"
+            "})()"
+        )
+        check("band cap rounded (tinted beyond endpoint)", cap["inside"] > 8, str(cap))
+        check("band cap falls off beyond width", cap["outside"] == 0, str(cap))
+
+        # 8l. Line color palette + custom color
+        n_sw = page.locator(".line-swatch").count()
+        check("color palette shown", n_sw == 10, f"{n_sw}")
+        old_color = page.evaluate("activeCrop().lines[0].color")
+        page.locator(".line-swatch").nth(3).click()
+        page.wait_for_timeout(200)
+        new_color = page.evaluate("activeCrop().lines[0].color")
+        check("swatch changes line color", new_color.lower() == "#ff7ad9", f"{old_color} -> {new_color}")
+        dot = page.evaluate("document.querySelector('.line-dot').style.background")
+        check("line dot follows color", "255, 122, 217" in dot, dot)
+        band_alpha = page.evaluate(
+            "(() => { const reg = activeCrop(); const line = reg.lines[0];"
+            " const band = lineBandCanvas(reg, line);"
+            " const d = band.getContext('2d').getImageData(0, 0, band.width, band.height).data;"
+            " let s = 0; for (let i = 3; i < d.length; i += 4) s += d[i]; return s; })()"
+        )
+        check("band regenerated after recolor", band_alpha > 0, f"{band_alpha}")
+        page.locator(".line-color-custom").evaluate(
+            "el => { el.value = '#123456'; el.dispatchEvent(new Event('input', { bubbles: true })); }"
+        )
+        page.wait_for_timeout(150)
+        check("custom color applies", page.evaluate("activeCrop().lines[0].color") == "#123456")
+        page.locator(".line-swatch").nth(0).click()
+        page.wait_for_timeout(150)
+
         # 9. Hide region on disk
         page.click("#toggleCropRegion")
         page.wait_for_timeout(300)
