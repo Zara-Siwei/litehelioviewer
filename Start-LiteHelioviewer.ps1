@@ -9,7 +9,7 @@ trap {
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $url = "http://127.0.0.1:8765"
-$version = "0.4.13"
+$version = "0.4.14"
 
 Set-Location $root
 $env:PYTHONIOENCODING = "utf-8"
@@ -44,8 +44,17 @@ if (-not $python) {
     exit 1
 }
 
-& $python -c "import fastapi, uvicorn, astropy, PIL, requests, numpy, multipart, websockets" 2>$null
-if ($LASTEXITCODE -ne 0) {
+# Probe without tripping ErrorActionPreference="Stop": a native command's
+# stderr under 2>$null becomes a terminating error, so catch it here and
+# treat it as "dependencies missing", which is exactly what we probe for.
+$depsOk = $false
+try {
+    & $python -c "import fastapi, uvicorn, astropy, PIL, requests, numpy, multipart, websockets" 2>$null
+    $depsOk = ($LASTEXITCODE -eq 0)
+} catch {
+    $depsOk = $false
+}
+if (-not $depsOk) {
     Write-Host "Installing Python requirements (first run only)..."
     & $python -m pip install -r (Join-Path $root "requirements.txt")
     if ($LASTEXITCODE -ne 0) {
