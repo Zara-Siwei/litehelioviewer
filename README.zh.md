@@ -4,6 +4,8 @@
 
 一个轻量的本地网页版太阳图像浏览器，数据来自 Helioviewer API。想法源于 [JHelioviewer-SWHV](https://github.com/Helioviewer-Project/JHelioviewer-SWHV)——那个项目很成熟，但日常只想快速看一眼太阳时有点重。LiteHelioviewer 保留了最常用的流程：加载 SDO/HMI、AIA、LASCO 近期的图，叠加图层，转动日面；又加上了我一直想要的小功能：圈一块区域细看，在上面画线分析。除了下载图像本身，所有东西都在本地运行。
 
+![LiteHelioviewer 主界面](assets/main.png)
+
 ## 快速开始
 
 Windows：双击 `run-litehelioviewer.bat`。它会自动找到 Python 3.9+，首次运行时安装依赖，然后启动后端并打开浏览器。
