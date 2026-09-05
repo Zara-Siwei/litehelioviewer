@@ -42,6 +42,9 @@ const smoothPrompt = document.getElementById("smoothPrompt");
 const smoothYes = document.getElementById("smoothYes");
 const smoothNo = document.getElementById("smoothNo");
 const lineList = document.getElementById("lineList");
+const cropExport = document.getElementById("cropExport");
+const cropExportBtn = document.getElementById("cropExportBtn");
+const cropExportMenu = document.getElementById("cropExportMenu");
 
 let layers = [];
 let imageCache = new Map();
@@ -139,6 +142,16 @@ function bindEvents() {
   showCropDockButton.addEventListener("click", toggleCropDock);
   toggleCropRegionButton.addEventListener("click", toggleCropRegionVisibility);
   resetCropViewButton.addEventListener("click", resetCropView);
+  cropExportBtn.addEventListener("click", () => toggleExportMenu());
+  cropExportMenu.querySelectorAll("[data-fmt]").forEach((button) => {
+    button.addEventListener("click", () => {
+      toggleExportMenu(false);
+      exportCropImage(button.dataset.fmt);
+    });
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!cropExportMenu.hidden && !cropExport.contains(event.target)) toggleExportMenu(false);
+  });
   toggleCropRegionButton.disabled = true;
   resetCropViewButton.disabled = true;
   sideTabInfo.addEventListener("click", () => setSideTab("info"));
@@ -659,6 +672,8 @@ function updateCropDock() {
   });
   toggleCropRegionButton.disabled = !active;
   resetCropViewButton.disabled = !active;
+  cropExportBtn.disabled = !active || !active.imageCanvas;
+  toggleExportMenu(false);
   toggleCropRegionButton.textContent = active?.hiddenOnDisk ? "Show region" : "Hide region";
   renderAnalysisPanel();
   resizeCropCanvas();
@@ -691,6 +706,76 @@ function resetCropView() {
 
 function defaultCropView() {
   return { zoom: 1, panX: 0, panY: 0 };
+}
+
+function toggleExportMenu(force) {
+  const open = typeof force === "boolean" ? force : cropExportMenu.hidden;
+  cropExportMenu.hidden = !open;
+}
+
+function exportFileName(region, ext) {
+  const meta = firstVisibleImageMetadata();
+  const helio = meta?.heliographic || {};
+  const raw = String(helio.date_obs || meta?.closest_date || meta?.date || "");
+  const stamp = raw.replace("T", "_").replace(/:/g, "").replace(/Z$/, "").slice(0, 16);
+  const base = region.name.replace(/\s+/g, "-");
+  return stamp ? `${base}_${stamp}.${ext}` : `${base}.${ext}`;
+}
+
+// Clean export: original CEA texture at native resolution plus the committed
+// analysis lines and their sampling bands. No axes, borders or margins.
+function exportCropImage(format) {
+  const region = activeCrop();
+  if (!region || !region.imageCanvas) {
+    appendLog("Nothing to export: no crop image", "error");
+    return;
+  }
+  const w = region.image.width;
+  const h = region.image.height;
+  const out = document.createElement("canvas");
+  out.width = w;
+  out.height = h;
+  const octx = out.getContext("2d");
+  octx.imageSmoothingEnabled = false;
+  octx.drawImage(region.imageCanvas, 0, 0);
+  const lines = region.lines || [];
+  for (const line of lines) {
+    const band = lineBandCanvas(region, line);
+    if (band) octx.drawImage(band, 0, 0);
+  }
+  octx.lineCap = "round";
+  octx.lineJoin = "round";
+  const lineWidth = Math.max(1.5, w / 260);
+  for (const line of lines) {
+    const pts = linePixelPoints(region, line);
+    if (pts.length < 2) continue;
+    octx.beginPath();
+    octx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) octx.lineTo(pts[i].x, pts[i].y);
+    octx.strokeStyle = line.color;
+    octx.globalAlpha = 0.95;
+    octx.lineWidth = lineWidth;
+    octx.stroke();
+    octx.globalAlpha = 1;
+  }
+  const ext = format === "jpg" ? "jpg" : "png";
+  const mime = format === "jpg" ? "image/jpeg" : "image/png";
+  const filename = exportFileName(region, ext);
+  out.toBlob((blob) => {
+    if (!blob) {
+      appendLog(`Export of ${region.name} failed`, "error");
+      return;
+    }
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    appendLog(`Exported ${region.name} as ${filename} (${w}x${h})`, "ok");
+  }, mime, 0.92);
 }
 
 function closeCrop(id) {
@@ -1109,10 +1194,6 @@ function updateLineHint() {
   }
 }
 
-function clampNormPoint(p) {
-  return { x: clamp(p.x, 0, 1), y: clamp(p.y, 0, 1) };
-}
-
 function cropCanvasToImageNorm(region, pos) {
   const g = cropPlotGeometry(region);
   const ix = region.image.width * 0.5 + (pos.x - g.centerX) / g.scale;
@@ -1126,7 +1207,7 @@ function lineDrawPointerDown(region, event) {
   if (lineDraw.mode === "freehand") {
     if (lineDraw.awaitingSmooth) return;
     lineDraw.drawing = true;
-    lineDraw.points = [clampNormPoint(cropCanvasToImageNorm(region, pos))];
+    lineDraw.points = [cropCanvasToCarrington(region, pos)];
     cropCanvas.setPointerCapture(event.pointerId);
     renderCropCanvas();
     return;
@@ -1136,7 +1217,9 @@ function lineDrawPointerDown(region, event) {
     lineDraw.dragKind = hit.kind;
     lineDraw.dragIndex = hit.index;
   } else {
-    const p = clampNormPoint(cropCanvasToImageNorm(region, pos));
+    const p = cropCanvasToCarrington(region, pos);
+    const ref = lineDraw.anchors.length ? lineDraw.anchors[lineDraw.anchors.length - 1].x : region.center.lon;
+    p.x = unwrapNearDeg(p.x, ref);
     lineDraw.anchors.push({ x: p.x, y: p.y, dx: 0, dy: 0, auto: true });
     bezierDefaultHandles(lineDraw.anchors);
     lineDraw.dragKind = "anchor";
@@ -1151,19 +1234,24 @@ function lineDrawPointerMove(region, event) {
   const pos = cropCanvasPosition(event);
   if (lineDraw.mode === "freehand") {
     if (!lineDraw.drawing) return;
-    const p = clampNormPoint(cropCanvasToImageNorm(region, pos));
+    const p = cropCanvasToCarrington(region, pos);
     const last = lineDraw.points[lineDraw.points.length - 1];
+    // keep the sampling density tied to screen pixels, in current window space
     const minDist = 2.5 / Math.min(region.image.width, region.image.height);
-    if (!last || Math.hypot(p.x - last.x, p.y - last.y) >= minDist) {
+    const pn = carringtonToCropNorm(region, p.x, p.y);
+    const ln = last ? carringtonToCropNorm(region, last.x, last.y) : null;
+    if (!last || Math.hypot(pn.x - ln.x, pn.y - ln.y) >= minDist) {
+      p.x = unwrapNearDeg(p.x, last ? last.x : region.center.lon);
       lineDraw.points.push(p);
       renderCropCanvas();
     }
     return;
   }
   if (!lineDraw.dragKind) return;
-  const p = clampNormPoint(cropCanvasToImageNorm(region, pos));
+  const p = cropCanvasToCarrington(region, pos);
   const anchor = lineDraw.anchors[lineDraw.dragIndex];
   if (!anchor) return;
+  p.x = unwrapNearDeg(p.x, anchor.x);
   if (lineDraw.dragKind === "anchor") {
     anchor.x = p.x;
     anchor.y = p.y;
@@ -1205,14 +1293,17 @@ function lineDrawHitTest(region, pos) {
   const imgW = region.image.width;
   const imgH = region.image.height;
   const pxU = cropCanvas.width / Math.max(1, cropCanvas.getBoundingClientRect().width);
-  const toPx = (nx, ny) => ({
-    x: g.centerX + (nx * imgW - imgW * 0.5) * g.scale,
-    y: g.centerY + (ny * imgH - imgH * 0.5) * g.scale,
-  });
+  const toPx = (lon, lat) => {
+    const n = carringtonToCropNorm(region, lon, lat);
+    return {
+      x: g.centerX + (n.x * imgW - imgW * 0.5) * g.scale,
+      y: g.centerY + (n.y * imgH - imgH * 0.5) * g.scale,
+    };
+  };
   const anchors = lineDraw.anchors;
   for (let i = anchors.length - 1; i >= 0; i--) {
     const a = anchors[i];
-    if (Math.abs(a.dx) < 1e-6 && Math.abs(a.dy) < 1e-6) continue;
+    if (Math.abs(a.dx) < 1e-9 && Math.abs(a.dy) < 1e-9) continue;
     const plus = toPx(a.x + a.dx, a.y + a.dy);
     const minus = toPx(a.x - a.dx, a.y - a.dy);
     if (Math.hypot(pos.x - plus.x, pos.y - plus.y) <= 8 * pxU) return { kind: "handlePlus", index: i };
@@ -1235,8 +1326,9 @@ function removeBezierAnchorAt(region, event) {
   const pxU = cropCanvas.width / Math.max(1, cropCanvas.getBoundingClientRect().width);
   for (let i = lineDraw.anchors.length - 1; i >= 0; i--) {
     const a = lineDraw.anchors[i];
-    const ax = g.centerX + (a.x * imgW - imgW * 0.5) * g.scale;
-    const ay = g.centerY + (a.y * imgH - imgH * 0.5) * g.scale;
+    const n = carringtonToCropNorm(region, a.x, a.y);
+    const ax = g.centerX + (n.x * imgW - imgW * 0.5) * g.scale;
+    const ay = g.centerY + (n.y * imgH - imgH * 0.5) * g.scale;
     if (Math.hypot(pos.x - ax, pos.y - ay) <= 9 * pxU) {
       if (lineDraw.anchors.length <= 2) {
         appendLog("A bezier line needs at least 2 anchors", "error");
@@ -1324,6 +1416,7 @@ function commitLineFromDraw(points, anchors) {
     cancelLineDraw();
     return;
   }
+  unwrapLineGeometry(points, anchors, region.center.lon);
   const editing = lineDraw.targetLineId ? region.lines.find((item) => item.id === lineDraw.targetLineId) : null;
   let name;
   if (editing) {
@@ -1653,14 +1746,19 @@ function lineBandCanvas(region, line) {
   const imgW = region.image.width;
   const imgH = region.image.height;
   const last = line.points[line.points.length - 1];
-  const key = [line.widthKm.toFixed(1), line.softness, imgW, imgH, line.points.length, last?.x, last?.y].join("|");
+  const key = [
+    line.widthKm.toFixed(1), line.softness, imgW, imgH, line.points.length, last?.x, last?.y,
+    region.bounds.xMin.toFixed(4), region.bounds.xMax.toFixed(4),
+    region.bounds.yMin.toFixed(4), region.bounds.yMax.toFixed(4),
+    region.frame.center.x.toFixed(5), region.frame.center.y.toFixed(5), region.frame.center.z.toFixed(5),
+  ].join("|");
   if (line.bandCanvas && line.bandKey === key) return line.bandCanvas;
   const band = document.createElement("canvas");
   band.width = imgW;
   band.height = imgH;
   const bctx = band.getContext("2d");
   bctx.clearRect(0, 0, imgW, imgH);
-  const pts = line.points.map((p) => ({ x: p.x * imgW, y: p.y * imgH }));
+  const pts = linePixelPoints(region, line);
   if (pts.length >= 2) {
     const halfKm = line.widthKm / 2;
     const kx = region.size.widthKm / imgW;
@@ -1699,8 +1797,13 @@ function drawCropLines(region, g) {
   const imgW = region.image.width;
   const imgH = region.image.height;
   const pxU = cropCanvas.width / Math.max(1, cropCanvas.getBoundingClientRect().width);
-  const toPxX = (nx) => g.centerX + (nx * imgW - imgW * 0.5) * g.scale;
-  const toPxY = (ny) => g.centerY + (ny * imgH - imgH * 0.5) * g.scale;
+  const toPx = (p) => {
+    const n = carringtonToCropNorm(region, p.x, p.y);
+    return {
+      x: g.centerX + (n.x * imgW - imgW * 0.5) * g.scale,
+      y: g.centerY + (n.y * imgH - imgH * 0.5) * g.scale,
+    };
+  };
   cropCtx.save();
   cropCtx.beginPath();
   cropCtx.rect(g.margin.left, g.margin.top, g.plotW, g.plotH);
@@ -1720,9 +1823,13 @@ function drawCropLines(region, g) {
     const editingThis = drawActive && lineDraw.targetLineId === line.id;
     const pts = editingThis && lineDraw.mode === "bezier" ? bezierPolyline(lineDraw.anchors) : line.points;
     if (!pts || pts.length < 2) continue;
+    const p0 = toPx(pts[0]);
     cropCtx.beginPath();
-    cropCtx.moveTo(toPxX(pts[0].x), toPxY(pts[0].y));
-    for (let i = 1; i < pts.length; i++) cropCtx.lineTo(toPxX(pts[i].x), toPxY(pts[i].y));
+    cropCtx.moveTo(p0.x, p0.y);
+    for (let i = 1; i < pts.length; i++) {
+      const pi = toPx(pts[i]);
+      cropCtx.lineTo(pi.x, pi.y);
+    }
     cropCtx.strokeStyle = line.color;
     cropCtx.globalAlpha = editingThis ? 0.55 : 0.95;
     cropCtx.lineWidth = Math.max(1.4, 1.8 * pxU);
@@ -1734,24 +1841,31 @@ function drawCropLines(region, g) {
     if (lineDraw.mode === "freehand" && lineDraw.points.length >= 2) draftPts = lineDraw.points;
     if (lineDraw.mode === "bezier" && !lineDraw.targetLineId && lineDraw.anchors.length >= 2) draftPts = bezierPolyline(lineDraw.anchors);
     if (draftPts && draftPts.length >= 2) {
+      const d0 = toPx(draftPts[0]);
       cropCtx.setLineDash([7 * pxU, 5 * pxU]);
       cropCtx.strokeStyle = "rgba(238, 246, 252, 0.92)";
       cropCtx.lineWidth = Math.max(1.4, 1.8 * pxU);
       cropCtx.beginPath();
-      cropCtx.moveTo(toPxX(draftPts[0].x), toPxY(draftPts[0].y));
-      for (let i = 1; i < draftPts.length; i++) cropCtx.lineTo(toPxX(draftPts[i].x), toPxY(draftPts[i].y));
+      cropCtx.moveTo(d0.x, d0.y);
+      for (let i = 1; i < draftPts.length; i++) {
+        const di = toPx(draftPts[i]);
+        cropCtx.lineTo(di.x, di.y);
+      }
       cropCtx.stroke();
       cropCtx.setLineDash([]);
     }
     if (lineDraw.mode === "bezier") {
       for (const a of lineDraw.anchors) {
-        const ax = toPxX(a.x);
-        const ay = toPxY(a.y);
-        if (Math.abs(a.dx) > 1e-6 || Math.abs(a.dy) > 1e-6) {
-          const hx1 = toPxX(a.x + a.dx);
-          const hy1 = toPxY(a.y + a.dy);
-          const hx2 = toPxX(a.x - a.dx);
-          const hy2 = toPxY(a.y - a.dy);
+        const ap = toPx(a);
+        const ax = ap.x;
+        const ay = ap.y;
+        if (Math.abs(a.dx) > 1e-9 || Math.abs(a.dy) > 1e-9) {
+          const hp = toPx({ x: a.x + a.dx, y: a.y + a.dy });
+          const hm = toPx({ x: a.x - a.dx, y: a.y - a.dy });
+          const hx1 = hp.x;
+          const hy1 = hp.y;
+          const hx2 = hm.x;
+          const hy2 = hm.y;
           cropCtx.strokeStyle = "rgba(255, 209, 122, 0.8)";
           cropCtx.lineWidth = Math.max(1, 1.1 * pxU);
           cropCtx.beginPath();
@@ -1819,7 +1933,7 @@ function computeLineProfile(region, line, sampler, N, M) {
   const imgH = region.image.height;
   const kx = region.size.widthKm / imgW;
   const ky = region.size.heightKm / imgH;
-  const pts = line.points.map((p) => ({ x: p.x * imgW, y: p.y * imgH }));
+  const pts = linePixelPoints(region, line);
   const cum = [0];
   for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
   const totalPx = cum[cum.length - 1] || 1;
@@ -2652,6 +2766,73 @@ function carringtonToBaseVector(carrLonDeg, latDeg, centralLonDeg, centerLatObsD
     y: cb * helio.y - sb * helio.z,
     z: sb * helio.y + cb * helio.z,
   };
+}
+
+function baseVectorToCarrington(v, centralLonDeg, centerLatObsDeg) {
+  const b0 = centerLatObsDeg * DEG2RAD;
+  const cb = Math.cos(b0);
+  const sb = Math.sin(b0);
+  const hy = cb * v.y + sb * v.z;
+  const hz = -sb * v.y + cb * v.z;
+  const stonyLon = Math.atan2(v.x, hz) * RAD2DEG;
+  return { lon: normalize360(stonyLon + centralLonDeg), lat: Math.asin(clamp(hy, -1, 1)) * RAD2DEG };
+}
+
+// --- crop lines are anchored in Carrington lon/lat -----------------------------
+// Line geometry is stored as {x: lon, y: lat} in degrees (and bezier handle
+// offsets as degrees), so moving a crop's A/B endpoints only moves the viewing
+// window; the line stays fixed on the Sun. All drawing/sampling projects the
+// stored coordinates into the crop's current local CEA frame.
+
+function carringtonToCropNorm(region, lonDeg, latDeg) {
+  const local = localCeaFromCarrington(lonDeg, latDeg, region.frame);
+  return {
+    x: (local.x - region.bounds.xMin) / (region.bounds.xMax - region.bounds.xMin),
+    y: (region.bounds.yMax - local.y) / (region.bounds.yMax - region.bounds.yMin),
+  };
+}
+
+function cropNormToCarrington(region, nx, ny) {
+  const x = region.bounds.xMin + nx * (region.bounds.xMax - region.bounds.xMin);
+  const y = region.bounds.yMax - ny * (region.bounds.yMax - region.bounds.yMin);
+  const base = localCeaToBaseVector(x, y, region.frame);
+  return baseVectorToCarrington(base, region.frame.centralLon, region.frame.centerLatObs);
+}
+
+function cropCanvasToCarrington(region, pos) {
+  const norm = cropCanvasToImageNorm(region, pos);
+  const p = cropNormToCarrington(region, clamp(norm.x, 0, 1), clamp(norm.y, 0, 1));
+  return { x: p.lon, y: p.lat };
+}
+
+// Keep longitudes on one consistent branch near a reference, so 2D bezier math
+// never sees a 359.9 -> 0.1 jump as a 360-degree step.
+function unwrapNearDeg(lonDeg, refDeg) {
+  return refDeg + ((((lonDeg - refDeg) % 360) + 540) % 360) - 180;
+}
+
+function unwrapLineGeometry(points, anchors, refDeg) {
+  let prev = refDeg;
+  for (const p of points) {
+    p.x = unwrapNearDeg(p.x, prev);
+    prev = p.x;
+  }
+  if (anchors) {
+    for (const a of anchors) {
+      a.x = unwrapNearDeg(a.x, prev);
+      prev = a.x;
+    }
+  }
+}
+
+// Project a stored line into the crop image's current pixel space.
+function linePixelPoints(region, line) {
+  const imgW = region.image.width;
+  const imgH = region.image.height;
+  return line.points.map((p) => {
+    const n = carringtonToCropNorm(region, p.x, p.y);
+    return { x: n.x * imgW, y: n.y * imgH };
+  });
 }
 
 function circularMeanDeg(a, b) {

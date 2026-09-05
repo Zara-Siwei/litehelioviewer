@@ -455,9 +455,73 @@ canvas {
 #cropCanvas {
   width: 100%;
   height: 100%;
+  display: block;
   background: #030609;
   cursor: grab;
   touch-action: none;
+}
+
+.crop-view {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.crop-export {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 5;
+  font-size: 12px;
+}
+
+.crop-export > button {
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid #2b3f52;
+  background: rgba(13, 22, 31, 0.86);
+  color: #cbd6e0;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+}
+
+.crop-export > button:hover:not(:disabled) {
+  border-color: #3f5a75;
+  color: #eef6fc;
+}
+
+.crop-export > button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.crop-export-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 88px;
+  border: 1px solid #2b3f52;
+  border-radius: 6px;
+  background: rgba(13, 22, 31, 0.96);
+  overflow: hidden;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+.crop-export-menu button {
+  padding: 7px 12px;
+  border: 0;
+  background: transparent;
+  color: #cbd6e0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.crop-export-menu button:hover {
+  background: #182636;
+  color: #eef6fc;
 }
 
 #cropCanvas.panning {

@@ -31,6 +31,8 @@ python start.py
 4. In Crop mode, click a green region on the disk to select it, then drag its **A/B** handles to adjust. When regions overlap, the innermost one wins; partial overlaps go to the most recently drawn crop.
 5. **Hide region** toggles a crop's overlay on the disk without deleting it; **Clear** removes all crops.
 
+**Export** (top-right of the crop image) saves the current patch as a clean PNG or JPG at its original resolution — drawn lines and their sampling bands included, axes and margins excluded.
+
 ## Line analysis (crop dock → Analysis tab)
 
 Click **+ Add line**, pick a source image layer, then a drawing mode:
@@ -43,6 +45,8 @@ Each line gets a collapsible settings row:
 - a **width** slider (km, logarithmic scale) and a **Gaussian σ** slider — the sampling weight across the line is `w(d) = exp(-d²/2σ²)` with `σ = s·W/2`, and `s = 0` gives a uniform band;
 - a live translucent band on the crop image that shows exactly which neighborhood is sampled;
 - a **Generate plot** button that renders a straightened RGB strip of the band plus an arc-length intensity profile (weighted mean of the layer luminance) beneath it.
+
+Lines are anchored in Carrington coordinates, so dragging a crop's A/B endpoints only moves the viewing window — the line stays fixed on the Sun. Each crop keeps its own set of lines.
 
 ## Roadmap
 

@@ -307,6 +307,76 @@ def run() -> None:
         check("line deleted", page.locator(".line-row").count() == 1)
         check("region lines back to one", page.evaluate("activeCrop().lines.length") == 1)
 
+        # 8i. Export the crop image: clean PNG/JPG at original size, lines included
+        page.click("#cropExportBtn")
+        page.wait_for_timeout(150)
+        check("export menu opens", page.locator("#cropExportMenu").is_visible())
+        exp_size = page.evaluate("(() => { const r = activeCrop(); return { w: r.image.width, h: r.image.height }; })()")
+        line_color = page.evaluate("activeCrop().lines[0].color")
+        with page.expect_download(timeout=15000) as dl_info:
+            page.click("#cropExportMenu button[data-fmt='png']")
+        download = dl_info.value
+        png_path = SHOTS / download.suggested_filename
+        download.save_as(str(png_path))
+        check("export filename is png", download.suggested_filename.endswith(".png"), download.suggested_filename)
+        try:
+            from PIL import Image
+            with Image.open(png_path) as im:
+                im.load()
+                check("export size matches original texture", im.size == (exp_size["w"], exp_size["h"]),
+                      f"{im.size} vs {exp_size['w']}x{exp_size['h']}")
+                rgb = im.convert("RGB")
+                small = rgb.resize((max(1, rgb.width // 2), max(1, rgb.height // 2)))
+                pixels = list(small.getdata())
+                import colorsys as _cs
+                lr, lg, lb = tuple(int(line_color[i:i+2], 16) for i in (1, 3, 5))
+                near = sum(1 for (pr, pg, pb) in pixels if abs(pr - lr) + abs(pg - lg) + abs(pb - lb) < 90)
+                check("export includes drawn line pixels", near > 20, f"{near} px near {line_color}")
+        except ImportError:
+            check("export file nonempty", png_path.stat().st_size > 10000, f"{png_path.stat().st_size} B")
+        with page.expect_download(timeout=15000) as dl2_info:
+            page.click("#cropExportBtn")
+            page.wait_for_timeout(120)
+            page.click("#cropExportMenu button[data-fmt='jpg']")
+        dl2 = dl2_info.value
+        jpg_path = SHOTS / dl2.suggested_filename
+        dl2.save_as(str(jpg_path))
+        check("export filename is jpg", dl2.suggested_filename.endswith(".jpg"), dl2.suggested_filename)
+        check("jpg export nonempty", jpg_path.stat().st_size > 5000, f"{jpg_path.stat().st_size} B")
+        check("export menu closes after pick", page.locator("#cropExportMenu").is_hidden())
+
+        # 8j. Lines are anchored in Carrington coordinates: dragging endpoint A
+        # moves the viewing window, not the line on the Sun.
+        line_before = page.evaluate("JSON.stringify(activeCrop().lines[0].points)")
+        bounds_before = page.evaluate("JSON.stringify(activeCrop().bounds)")
+        norm_before = page.evaluate(
+            "(() => { const reg = activeCrop(); const p = reg.lines[0].points[0];"
+            " return JSON.stringify(carringtonToCropNorm(reg, p.x, p.y)); })()"
+        )
+        handle = page.evaluate(
+            "(() => { const reg = activeCrop(); const v = viewGeometry();"
+            " const p = projectBasePoint(reg.start.base, v.cx, v.cy, v.r);"
+            " const rect = canvas.getBoundingClientRect();"
+            " return { x: rect.x + (p.x * rect.width) / canvas.width,"
+            "          y: rect.y + (p.y * rect.height) / canvas.height, visible: p.visible }; })()"
+        )
+        check("endpoint A handle located", bool(handle) and handle["visible"], str(handle))
+        page.mouse.move(handle["x"], handle["y"])
+        page.mouse.down()
+        page.mouse.move(handle["x"] + 55, handle["y"] + 45, steps=8)
+        page.mouse.up()
+        page.wait_for_timeout(800)
+        bounds_after = page.evaluate("JSON.stringify(activeCrop().bounds)")
+        check("crop bounds changed by A drag", bounds_after != bounds_before)
+        line_after = page.evaluate("JSON.stringify(activeCrop().lines[0].points)")
+        check("line fixed in Carrington coords", line_after == line_before)
+        norm_after = page.evaluate(
+            "(() => { const reg = activeCrop(); const p = reg.lines[0].points[0];"
+            " return JSON.stringify(carringtonToCropNorm(reg, p.x, p.y)); })()"
+        )
+        check("line shifts within the moved window", norm_after != norm_before)
+        page.screenshot(path=str(SHOTS / "shot-08e-line-anchored.png"))
+
         # 9. Hide region on disk
         page.click("#toggleCropRegion")
         page.wait_for_timeout(300)
