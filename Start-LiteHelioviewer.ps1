@@ -1,8 +1,15 @@
 $ErrorActionPreference = "Stop"
 
+trap {
+    Write-Host ""
+    Write-Host "LiteHelioviewer failed to start: $($_.Exception.Message)"
+    Read-Host "Press Enter to close this launcher"
+    exit 1
+}
+
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $url = "http://127.0.0.1:8765"
-$version = "0.4.12"
+$version = "0.4.13"
 
 Set-Location $root
 $env:PYTHONIOENCODING = "utf-8"
