@@ -46,6 +46,13 @@ const cropExport = document.getElementById("cropExport");
 const cropExportBtn = document.getElementById("cropExportBtn");
 const cropExportMenu = document.getElementById("cropExportMenu");
 
+// Tell the backend a browser tab is still open. Once a heartbeat has been
+// seen, the server shuts itself down shortly after the last tab disappears,
+// so closing the browser also closes the launcher console window.
+setInterval(() => {
+  fetch("/api/heartbeat", { method: "POST" }).catch(() => {});
+}, 5000);
+
 let layers = [];
 let imageCache = new Map();
 let viewQuat = quatIdentity();

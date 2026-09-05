@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $url = "http://127.0.0.1:8765"
-$version = "0.4.6"
+$version = "0.4.7"
 
 Set-Location $root
 $env:PYTHONIOENCODING = "utf-8"
@@ -53,7 +53,8 @@ Write-Host "URL: $url"
 Write-Host "Data: $root\data"
 Write-Host "Python: $python"
 Write-Host ""
-Write-Host "This window is the backend. Close it to stop LiteHelioviewer."
+Write-Host "This window is the backend. It closes by itself about a minute after"
+Write-Host "the browser tab is closed; closing this window also stops LiteHelioviewer."
 Write-Host ""
 
 $existing = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1

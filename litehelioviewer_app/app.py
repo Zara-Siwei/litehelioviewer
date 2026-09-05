@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+import os
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +40,49 @@ app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 _samp_bridge: SampBridge | None = None
+
+# --- Browser-presence watchdog -------------------------------------------
+# The UI POSTs /api/heartbeat every few seconds while a browser tab is open.
+# Once at least one heartbeat has been seen, losing it for longer than
+# LHV_AUTOSTOP_SECONDS (default 60) means the browser is gone, and this
+# local backend shuts itself down so the launcher console closes with it.
+# Pure API/CLI usage never sends a heartbeat, so it is never auto-stopped.
+# Set LHV_NO_AUTOSTOP=1 to disable the watchdog entirely.
+_AUTOSTOP_SECONDS = float(os.environ.get("LHV_AUTOSTOP_SECONDS", "60"))
+_heartbeat_lock = threading.Lock()
+_heartbeat_last: float | None = None  # monotonic time of the last heartbeat
+
+
+def _watchdog_loop() -> None:
+    interval = max(1.0, min(5.0, _AUTOSTOP_SECONDS / 4))
+    while True:
+        time.sleep(interval)
+        with _heartbeat_lock:
+            last = _heartbeat_last
+        if last is None:
+            continue  # browser never connected: stay alive for API/CLI use
+        if time.monotonic() - last > _AUTOSTOP_SECONDS:
+            print(
+                f"Browser closed (no heartbeat for {_AUTOSTOP_SECONDS:.0f}s); "
+                "LiteHelioviewer is shutting down.",
+                flush=True,
+            )
+            os._exit(0)
+
+
+def _start_watchdog() -> None:
+    if os.environ.get("LHV_NO_AUTOSTOP"):
+        return
+
+    class _HeartbeatAccessFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "/api/heartbeat" not in record.getMessage()
+
+    logging.getLogger("uvicorn.access").addFilter(_HeartbeatAccessFilter())
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
+
+
+_start_watchdog()
 
 # If the nearest archive frame is farther than this from the requested time,
 # skip the heavy JP2 download on that server and try the next one first.
@@ -78,6 +125,14 @@ def presets():
 @app.get("/api/health")
 def health():
     return {"ok": True, "name": "LiteHelioviewer", "version": __version__, "layers": len(store.layers)}
+
+
+@app.post("/api/heartbeat")
+def heartbeat():
+    global _heartbeat_last
+    with _heartbeat_lock:
+        _heartbeat_last = time.monotonic()
+    return {"ok": True}
 
 
 @app.get("/api/layers")

@@ -15,6 +15,8 @@ pip install -r requirements.txt
 python start.py
 ```
 
+The backend watches the browser: while a tab is open the page sends a heartbeat, and about a minute after the last tab closes the server shuts itself down (the launcher console window closes with it). Closing the console window also stops everything. Pure API/CLI use without a browser is never auto-stopped; set `LHV_NO_AUTOSTOP=1` to disable the watchdog, or `LHV_AUTOSTOP_SECONDS` to change the 60-second timeout.
+
 ## Features
 
 - Download layers through the Helioviewer API (SDO/HMI magnetogram and continuum, SDO/AIA channels, SOHO/LASCO C2/C3) with nearest-frame local caching; stack layers with per-layer opacity and visibility.

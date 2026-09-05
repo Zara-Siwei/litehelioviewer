@@ -12,6 +12,7 @@ falls back to a live Helioviewer download and may take longer.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -581,6 +582,49 @@ def run() -> None:
         page.screenshot(path=str(SHOTS / "shot-10-region-pick.png"))
         page.click("#clearCrops")
         page.keyboard.press("Escape")
+
+        # 9. Browser-presence watchdog: backend self-stops after the tab closes
+        auto_url = "http://127.0.0.1:8767/"
+        auto_proc = subprocess.Popen(
+            [PYTHON, "-m", "litehelioviewer_app.cli", "serve", "--host", "127.0.0.1", "--port", "8767"],
+            cwd=str(ROOT),
+            env=dict(os.environ, LHV_AUTOSTOP_SECONDS="4"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            healthy = False
+            for _ in range(60):
+                try:
+                    with urllib.request.urlopen(f"{auto_url}api/health", timeout=1) as resp:
+                        if resp.status == 200:
+                            healthy = True
+                            break
+                except Exception:
+                    pass
+                if auto_proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+            check("autostop test backend started", healthy)
+
+            page2 = browser.new_page()
+            page2.goto(auto_url, wait_until="domcontentloaded")
+            # heartbeat faster than the 4 s watchdog timeout
+            page2.evaluate("setInterval(() => fetch('/api/heartbeat', { method: 'POST' }).catch(() => {}), 400)")
+            page2.wait_for_timeout(6000)
+            check("autostop backend alive while tab open", auto_proc.poll() is None)
+
+            page2.close()
+            deadline = time.time() + 20
+            while time.time() < deadline and auto_proc.poll() is None:
+                time.sleep(0.5)
+            check(
+                "autostop backend exited after tab closed",
+                auto_proc.poll() is not None,
+                f"exit code {auto_proc.poll()}",
+            )
+        finally:
+            stop_backend(auto_proc)
 
         browser.close()
 
