@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import __version__
+from . import __version__, progress
 from .config import DATA_DIR, STATIC_DIR, UPLOAD_DIR
 from .fits_utils import fits_to_png
 from .helioviewer import (
@@ -133,6 +133,11 @@ def presets():
 @app.get("/api/health")
 def health():
     return {"ok": True, "name": "LiteHelioviewer", "version": __version__, "layers": len(store.layers)}
+
+
+@app.get("/api/download/progress")
+def download_progress():
+    return {"downloads": progress.snapshot()}
 
 
 @app.websocket("/ws")

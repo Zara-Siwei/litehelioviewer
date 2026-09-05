@@ -10,6 +10,10 @@ const viewReadout = document.getElementById("viewReadout");
 const dropZone = document.getElementById("dropZone");
 const logPanel = document.getElementById("logPanel");
 const coordReadout = document.getElementById("coordReadout");
+const dlProgressEl = document.getElementById("dlProgress");
+const dlProgressLabel = document.getElementById("dlProgressLabel");
+const dlProgressBar = document.getElementById("dlProgressBar");
+const dlProgressText = document.getElementById("dlProgressText");
 const workspace = document.getElementById("workspace");
 const panelEl = document.getElementById("panel");
 const panelSplitter = document.getElementById("panelSplitter");
@@ -530,6 +534,7 @@ async function handleLayerInput(event) {
 async function addHelioviewerLayer() {
   setStatus("Downloading...");
   appendLog(`Download requested: ${serverEl.value} ${presetEl.value} ${toApiDate(dateEl.value)}`);
+  startDownloadProgress();
   try {
     const result = await api("/api/load/helioviewer", {
       method: "POST",
@@ -555,6 +560,8 @@ async function addHelioviewerLayer() {
   } catch (error) {
     setStatus("Download failed");
     appendLog(error.message, "error");
+  } finally {
+    stopDownloadProgress();
   }
 }
 
@@ -589,6 +596,7 @@ async function togglePfss() {
   const context = pfssContext();
   setStatus("Loading PFSS...");
   appendLog(`PFSS requested: ${context.date}; Carrington center=${context.centralLon.toFixed(2)}${context.approx ? " approx" : ""}`);
+  startDownloadProgress();
   try {
     const result = await api("/api/control/pfss", {
       method: "POST",
@@ -607,6 +615,8 @@ async function togglePfss() {
   } catch (error) {
     setStatus("PFSS failed");
     appendLog(error.message, "error");
+  } finally {
+    stopDownloadProgress();
   }
 }
 
@@ -3177,6 +3187,76 @@ function toApiDate(value) {
 
 function setStatus(text) {
   statusEl.textContent = text;
+}
+
+let dlPollTimer = null;
+let dlHideTimer = null;
+
+function formatBytes(value) {
+  const n = Number(value) || 0;
+  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
+  if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(0)} KB`;
+  return `${n} B`;
+}
+
+function formatSizePair(received, total) {
+  const mb = 1 << 20;
+  const kb = 1 << 10;
+  if (total >= mb) return `${(received / mb).toFixed(1)} / ${(total / mb).toFixed(1)} MB`;
+  if (total >= kb) return `${Math.round(received / kb)} / ${Math.round(total / kb)} KB`;
+  return `${received} / ${total} B`;
+}
+
+function renderDownloadProgress(items) {
+  const list = Array.isArray(items) ? items : [];
+  const item = [...list].reverse().find((entry) => !entry.done) || list[list.length - 1];
+  if (!item) {
+    dlProgressEl.hidden = true;
+    return;
+  }
+  const received = Number(item.received) || 0;
+  const total = Number(item.total) || 0;
+  dlProgressLabel.textContent = item.label || "Downloading";
+  if (total > 0) {
+    const pct = clamp((received / total) * 100, 0, 100);
+    dlProgressBar.classList.remove("indeterminate");
+    dlProgressBar.style.width = `${pct}%`;
+    dlProgressText.textContent = `${formatSizePair(received, total)} · ${pct.toFixed(0)}%`;
+  } else {
+    dlProgressBar.classList.add("indeterminate");
+    dlProgressBar.style.width = "";
+    dlProgressText.textContent = formatBytes(received);
+  }
+  dlProgressEl.hidden = false;
+}
+
+async function pollDownloadProgress() {
+  try {
+    const response = await fetch("/api/download/progress");
+    if (!response.ok) return;
+    const data = await response.json();
+    renderDownloadProgress(data.downloads || []);
+  } catch {
+    // backend momentarily unreachable: keep the last rendered state
+  }
+}
+
+function startDownloadProgress() {
+  clearTimeout(dlHideTimer);
+  if (!dlPollTimer) {
+    pollDownloadProgress();
+    dlPollTimer = setInterval(pollDownloadProgress, 300);
+  }
+}
+
+function stopDownloadProgress() {
+  clearInterval(dlPollTimer);
+  dlPollTimer = null;
+  pollDownloadProgress();  // final snapshot: show the completed 100% state
+  clearTimeout(dlHideTimer);
+  dlHideTimer = setTimeout(() => {
+    dlProgressEl.hidden = true;
+  }, 900);
 }
 
 function fitCoronaLayer(metadata) {

@@ -335,6 +335,70 @@ canvas {
   white-space: pre-line;
 }
 
+.dl-progress {
+  position: absolute;
+  left: 50%;
+  bottom: 40px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100% - 380px);
+  border: 1px solid rgba(66, 88, 106, 0.72);
+  border-radius: 8px;
+  background: rgba(6, 10, 15, 0.78);
+  color: #aeb9c4;
+  padding: 6px 12px;
+  font-size: 12px;
+  pointer-events: none;
+  opacity: 0.92;
+  transition: opacity 0.3s ease;
+}
+
+.dl-progress-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+.dl-progress-track {
+  width: 150px;
+  height: 4px;
+  flex: 0 0 auto;
+  border-radius: 2px;
+  background: rgba(66, 88, 106, 0.45);
+  overflow: hidden;
+}
+
+.dl-progress-bar {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: 2px;
+  background: #4aa3ff;
+  transition: width 0.25s ease;
+}
+
+.dl-progress-bar.indeterminate {
+  width: 32%;
+  animation: dl-progress-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes dl-progress-slide {
+  0% { margin-left: -32%; }
+  100% { margin-left: 100%; }
+}
+
+.dl-progress-text {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  white-space: nowrap;
+}
+
+.dl-progress[hidden] {
+  display: none;
+}
+
 .drop-active {
   outline: 2px solid #4aa3ff;
   outline-offset: -10px;

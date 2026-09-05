@@ -10,6 +10,7 @@ import numpy as np
 import requests
 from astropy.io import fits
 
+from . import progress
 from .config import CACHE_DIR
 from .helioviewer import normalize_date, safe_stamp, safe_token
 
@@ -121,11 +122,29 @@ def download_pfss_file(entry: PfssEntry) -> tuple[Path, bool]:
     local_path = PFSS_CACHE_DIR / f"{safe_stamp(entry.date.strftime('%Y-%m-%dT%H:%M:%SZ'))}_{safe_token(entry.relative_path)}.fits"
     if local_path.exists() and local_path.stat().st_size > 0:
         return local_path, True
-    response = requests.get(entry.url, timeout=90)
-    response.raise_for_status()
-    if len(response.content) < 1024:
-        raise RuntimeError(f"PFSS download too small from {entry.url}")
-    local_path.write_bytes(response.content)
+    task = progress.begin(f"PFSS · {entry.date:%Y-%m-%d %H:%M} UT")
+    partial = local_path.with_name(local_path.name + ".part")
+    try:
+        with requests.get(entry.url, timeout=90, stream=True) as response:
+            response.raise_for_status()
+            total = int(response.headers.get("content-length") or 0)
+            progress.update(task, 0, total)
+            received = 0
+            with partial.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=262144):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    received += len(chunk)
+                    progress.update(task, received)
+        if received < 1024:
+            raise RuntimeError(f"PFSS download too small from {entry.url}")
+        partial.replace(local_path)
+    except Exception as exc:
+        partial.unlink(missing_ok=True)
+        progress.finish(task, error=str(exc))
+        raise
+    progress.finish(task)
     return local_path, False
 
 

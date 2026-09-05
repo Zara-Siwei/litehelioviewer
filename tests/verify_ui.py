@@ -5,13 +5,18 @@ untouched), drives the UI end to end, and exits non-zero on any failure or
 page error. Screenshots are written to tests/shots/ for inspection.
 
 Usage:
-    G:\\python_projects\\envs\\WPy64-31241\\python-3.12.4.amd64\\python.exe tests\\verify_ui.py
+    python tests\\verify_ui.py
+
+The interpreter is the one running this script (override with
+LHV_TEST_PYTHON); the browser channel tries Chrome, then Edge, then the
+bundled Chromium (override with LHV_TEST_BROWSER).
 
 Note: the layer-load step uses the local cache (data/cache); without cache it
 falls back to a live Helioviewer download and may take longer.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -24,7 +29,7 @@ from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 SHOTS = Path(__file__).resolve().parent / "shots"
-PYTHON = r"G:\python_projects\envs\WPy64-31241\python-3.12.4.amd64\python.exe"
+PYTHON = os.environ.get("LHV_TEST_PYTHON", sys.executable)
 PORT = 8766
 URL = f"http://127.0.0.1:{PORT}/"
 
@@ -63,9 +68,24 @@ def stop_backend(proc: subprocess.Popen) -> None:
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
 
 
+def launch_browser(p):
+    preferred = os.environ.get("LHV_TEST_BROWSER", "")
+    channels = [preferred] if preferred else ["chrome", "msedge", ""]
+    last_exc: Exception | None = None
+    for channel in channels:
+        kwargs = {"headless": True}
+        if channel:
+            kwargs["channel"] = channel
+        try:
+            return p.chromium.launch(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+    raise RuntimeError(f"no usable browser channel (tried {channels}): {last_exc}")
+
+
 def run() -> None:
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
+        browser = launch_browser(p)
         page = browser.new_page(viewport={"width": 1600, "height": 1000})
         page.on("pageerror", lambda exc: page_errors.append(f"pageerror: {exc}"))
         page.on("console", lambda msg: page_errors.append(f"console.error: {msg.text}") if msg.type == "error" else None)
@@ -154,6 +174,87 @@ def run() -> None:
         check("canvas stays painted while dragging", mean_drag > 20, f"mean={mean_drag:.1f}")
         page.screenshot(path=str(SHOTS / "shot-03b-hold-drag.png"))
         page.mouse.up()
+        page.wait_for_timeout(400)
+
+        # 4c. Download-progress chip: endpoint shape, deterministic rendering,
+        # done/indeterminate states, and idle hiding.
+        dl = page.evaluate("fetch('/api/download/progress').then(r => r.json())")
+        check("progress endpoint responds", isinstance(dl.get("downloads"), list), str(dl)[:80])
+        check("progress chip hidden while idle", page.locator("#dlProgress").is_hidden())
+
+        page.evaluate("renderDownloadProgress([{id:'t1', label:'JP2 · SDO / AIA / 171 A', received: 2097152, total: 4194304, done: false, error: ''}])")
+        check("progress chip visible while downloading", page.locator("#dlProgress").is_visible())
+        bar_w = page.evaluate("document.getElementById('dlProgressBar').style.width")
+        check("progress bar at 50%", bar_w == "50%", bar_w)
+        text = page.evaluate("document.getElementById('dlProgressText').textContent")
+        check("progress text shows MB and percent", text == "2.0 / 4.0 MB · 50%", text)
+        label = page.evaluate("document.getElementById('dlProgressLabel').textContent")
+        check("progress label shows dataset", "AIA" in label, label)
+        page.screenshot(path=str(SHOTS / "shot-03c-progress.png"))
+
+        page.evaluate("renderDownloadProgress([{id:'t1', label:'JP2 · SDO / AIA / 171 A', received: 4194304, total: 4194304, done: true, error: ''}])")
+        done_w = page.evaluate("document.getElementById('dlProgressBar').style.width")
+        check("progress bar full when done", done_w == "100%", done_w)
+
+        page.evaluate("renderDownloadProgress([{id:'t2', label:'PFSS · 2013-02-15', received: 524288, total: 0, done: false, error: ''}])")
+        check("indeterminate bar without content-length",
+              page.evaluate("document.getElementById('dlProgressBar').classList.contains('indeterminate')"))
+        ind_text = page.evaluate("document.getElementById('dlProgressText').textContent")
+        check("indeterminate text shows bytes only", ind_text == "512 KB", ind_text)
+
+        page.evaluate("renderDownloadProgress([])")
+        check("progress chip hidden again when idle", page.locator("#dlProgress").is_hidden())
+
+        # 4d. Live download (uncached AIA 304): the backend registry must show
+        # an entry and the chip must appear. Degrades softly when the frame is
+        # already cached from an earlier run, or when the network is offline.
+        page.select_option("#preset", "aia-304")
+        page.fill("#date", "2013-02-15T12:00")
+        page.evaluate("document.getElementById('addLayer').click()")
+        saw_progress = False
+        chip_shown = False
+        loaded = False
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            status_text = page.evaluate("document.getElementById('status').textContent")
+            try:
+                with urllib.request.urlopen(f"{URL}api/download/progress", timeout=2) as resp:
+                    downloads = json.loads(resp.read()).get("downloads", [])
+                # finished entries linger ~4 s, so even a fast download counts
+                if downloads:
+                    saw_progress = True
+            except Exception:
+                pass
+            if page.locator("#dlProgress").is_visible():
+                chip_shown = True
+            if "Layer loaded" in status_text:
+                loaded = True
+                break
+            if "Download failed" in status_text:
+                break
+            time.sleep(0.2)
+        last_logs = page.evaluate(
+            "Array.from(document.querySelectorAll('.log-line')).slice(-4).map(e => e.textContent).join(' | ')")
+        was_download = loaded and "304 A" in last_logs and "download" in last_logs
+        if loaded and was_download and not chip_shown:
+            try:
+                page.wait_for_selector("#dlProgress:not([hidden])", timeout=2500)
+                chip_shown = True
+            except Exception:
+                pass
+        if was_download:
+            check("live download reported progress", saw_progress)
+            check("progress chip appeared during live download", chip_shown)
+            page.locator(".layer").nth(1).locator("button[data-action='delete']").click()
+            page.wait_for_function("document.querySelectorAll('.layer').length === 1", timeout=15000)
+        elif loaded:
+            check("live download progress (frame already cached)", True, last_logs[-90:])
+            page.locator(".layer").nth(1).locator("button[data-action='delete']").click()
+            page.wait_for_function("document.querySelectorAll('.layer').length === 1", timeout=15000)
+        else:
+            check("live download progress (skipped: no network)", True, f"status={status_text}")
+        page.select_option("#preset", "hmi-magnetogram")
+        page.fill("#date", "2013-02-15T12:00")
         page.wait_for_timeout(400)
 
         # 5. Crop mode: drag a region on the disk

@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image
 import requests
 
+from . import progress
 from .config import CACHE_DIR
 from .lut_utils import apply_lut, preset_lut_name
 
@@ -170,7 +171,7 @@ class HelioviewerClient:
         jp2_cached = jp2_path.exists() and jp2_path.stat().st_size > 0
         png_cached = png_path.exists() and png_path.stat().st_size > 0
         if not jp2_cached:
-            jp2_path.write_bytes(self.get_jp2_image(source_id, normalized_date))
+            self.download_jp2_image(source_id, normalized_date, jp2_path, preset=preset)
         if not png_cached:
             self.render_jp2(jp2_path, png_path, lut_name)
         mapping = closest_mapping(closest, header, preset)
@@ -216,6 +217,39 @@ class HelioviewerClient:
         if "jp2" not in content_type and "image" not in content_type:
             raise RuntimeError(response.text[:500])
         return response.content
+
+    def download_jp2_image(self, source_id: int, date: str, destination: Path, preset: str = "") -> None:
+        """Stream a JP2 to disk, reporting byte progress to the registry."""
+        label = str(PRESETS.get(preset, {}).get("name") or preset or f"source {source_id}")
+        task = progress.begin(f"JP2 · {label}")
+        partial = destination.with_name(destination.name + ".part")
+        try:
+            with requests.get(
+                urljoin(self.base_url, "getJP2Image/"),
+                params={"sourceId": source_id, "date": date},
+                timeout=self.timeout,
+                stream=True,
+            ) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                if "jp2" not in content_type and "image" not in content_type:
+                    raise RuntimeError(response.text[:500])
+                total = int(response.headers.get("content-length") or 0)
+                progress.update(task, 0, total)
+                received = 0
+                with partial.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=262144):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        received += len(chunk)
+                        progress.update(task, received)
+            partial.replace(destination)
+        except Exception as exc:
+            partial.unlink(missing_ok=True)
+            progress.finish(task, error=str(exc))
+            raise
+        progress.finish(task)
 
     def get_jp2_header(self, image_id: Any) -> dict[str, Any]:
         if not image_id:

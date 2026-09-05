@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>LiteHelioviewer</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/style.css?v=0.4.14" />
+    <link rel="stylesheet" href="/static/style.css?v=0.4.15" />
   </head>
   <body>
     <aside class="panel" id="panel">
@@ -74,6 +74,11 @@
           <span id="viewReadout">lon 0.0 / lat 0.0</span>
         </div>
         <div id="coordReadout" class="coord-readout">Mouse: off disk</div>
+        <div id="dlProgress" class="dl-progress" hidden>
+          <span id="dlProgressLabel" class="dl-progress-label"></span>
+          <span class="dl-progress-track"><span id="dlProgressBar" class="dl-progress-bar"></span></span>
+          <span id="dlProgressText" class="dl-progress-text"></span>
+        </div>
       </div>
       <button id="showCropDock" class="crop-show" hidden>Crops</button>
 
@@ -134,6 +139,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=0.4.14"></script>
+    <script src="/static/app.js?v=0.4.15"></script>
   </body>
 </html>
