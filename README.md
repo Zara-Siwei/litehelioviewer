@@ -1,62 +1,34 @@
 # LiteHelioviewer
 
-A lightweight local web viewer for Helioviewer solar images.
+English | [中文](README.zh.md)
 
-This project stands on the shoulders of the mature [JHelioviewer-SWHV](https://github.com/Helioviewer-Project/JHelioviewer-SWHV) project — our foundation and reference. The original is excellent but a bit heavy for quick daily browsing, and it does not offer small patch-level tools, so LiteHelioviewer trims the everyday workflow (load recent SDO/HMI, AIA and LASCO frames, stack layers, rotate the solar disk) down to a tiny double-click local app, and adds the little things we missed: CEA Patch crops and crop line analysis. Everything runs locally except the image downloads themselves.
+A lightweight local web viewer for solar images from the Helioviewer API. It grew out of [JHelioviewer-SWHV](https://github.com/Helioviewer-Project/JHelioviewer-SWHV), which is mature and complete but a bit heavy when I just want a quick look at the Sun. LiteHelioviewer keeps the everyday workflow — load recent SDO/HMI, AIA and LASCO frames, stack layers, rotate the disk — and adds the small things I kept missing: cropping a patch and drawing lines on it. Everything runs locally except the image downloads themselves.
 
 ## Quick start
 
-**Windows:** double-click `run-litehelioviewer.bat`. The launcher finds a Python 3.9+ interpreter, installs the requirements on first run, starts the backend, and opens the browser at `http://127.0.0.1:8765`.
+Windows: double-click `run-litehelioviewer.bat`. It finds a Python 3.9+ interpreter, installs the requirements on first run, starts the backend and opens the browser.
 
-**Any OS:**
+Any OS:
 
-```bash
+```
 pip install -r requirements.txt
 python start.py
 ```
 
-The backend watches the browser over a WebSocket: the socket drops the instant the last tab closes, and the server shuts itself down within seconds (the launcher console window closes with it). A page reload reconnects inside the grace window, and a background tab keeps its socket, so neither stops the backend. Closing the console window also stops everything. Pure API/CLI use without a browser is never auto-stopped; set `LHV_NO_AUTOSTOP=1` to disable the watchdog, or `LHV_AUTOSTOP_SECONDS` to change the 3-second reconnect grace.
+## Basic use
 
-## Features
+Pick a layer, a date and a time, and load it. Drag the disk to rotate it, scroll to zoom. Local FITS files can be dropped onto the window, and PFSS field lines can be overlaid.
 
-- Download layers through the Helioviewer API (SDO/HMI magnetogram and continuum, SDO/AIA channels, SOHO/LASCO C2/C3) with nearest-frame local caching; stack layers with per-layer opacity and visibility.
-- Archive gaps are made visible: for some dates the archive simply has no frames — e.g. there is no HMI magnetogram near 2011-02-14 00:00 UTC, so the nearest available frame (about a day later) is used instead. Each layer card shows the actual frame time, and frames far from the requested time are flagged with a ⚠ badge and a log warning.
-- Orthographic solar disk with a Stonyhurst grid: drag to rotate (trackball keeps the grabbed surface point under the cursor), mouse wheel to zoom.
-- Open local FITS files by drag and drop, and overlay PFSS magnetic field lines.
-- Collapsible, resizable sidebar and bottom crop dock; the main view reflows around them.
+Click **Crop** and drag two points on the disk to mark a region. Each region opens as a CEA-projected patch in the bottom dock, with axes in kilometers; the patch can be zoomed and panned to inspect details. In crop mode, click a green region to select it and adjust its two corners again.
 
-## CEA Patch crops
+On a patch you can draw analysis lines, freehand or bezier. Each line has a width and a Gaussian weighting across it, and the plot button renders the straightened strip of the line together with the intensity profile along it.
 
-1. Click **Crop**, then drag two points on the solar disk. A local Carrington-centered CEA (cylindrical equal-area) rectangle is computed and overlaid in green.
-2. Each crop opens as a tab (`CEA Patch 1`, `CEA Patch 2`, ...) in the bottom dock, with km axes centered on 0.
-3. On the crop image: mouse wheel zooms around the cursor, left-drag pans, **Reset** restores the fit view.
-4. In Crop mode, click a green region on the disk to select it, then drag its **A/B** handles to adjust. When regions overlap, the innermost one wins; partial overlaps go to the most recently drawn crop.
-5. **Hide region** toggles a crop's overlay on the disk without deleting it; **Clear** removes all crops.
+## Recent changes
 
-**Export** (top-right of the crop image) saves the current patch as a clean PNG or JPG at its original resolution — drawn lines and their sampling bands included, axes and margins excluded.
+- Patches can be exported as clean PNG/JPG images, drawn lines included.
+- Lines are now anchored in Carrington coordinates, so adjusting a crop region only moves the viewing window — the lines stay put on the Sun.
+- Lines can be colored, from a palette or a custom color picker.
 
-## Line analysis (crop dock → Analysis tab)
+## Planned
 
-Click **+ Add line**, pick a source image layer, then a drawing mode:
-
-- **Freehand** — hold and drag on the crop image; on release you can accept an optional smoothing pass.
-- **Bezier** — click anchor points, then shape the curve with each anchor's symmetric slope handles. Right-click deletes an anchor, Enter/Done finishes, and a saved bezier line can be re-edited later with its ✎ button.
-
-Each line gets a collapsible settings row:
-
-- a **width** slider (km, logarithmic scale) and a **Gaussian σ** slider — the sampling weight across the line is `w(d) = exp(-d²/2σ²)` with `σ = s·W/2`, and `s = 0` gives a uniform band;
-- a live translucent band on the crop image that shows exactly which neighborhood is sampled (the band ends in rounded capsule caps that follow the same weight falloff);
-- a color palette with preset swatches plus a custom color picker;
-- a line style selector (**solid / dashed / dotted**), a stroke-width slider for the line itself, and a **Band** toggle that shows or hides the translucent sampling band (off = a plain line);
-- a **Generate plot** button that renders a straightened RGB strip of the band plus an arc-length intensity profile (weighted mean of the layer luminance) beneath it.
-
-Lines are anchored in Carrington coordinates, so dragging a crop's A/B endpoints only moves the viewing window — the line stays fixed on the Sun. Each crop keeps its own set of lines.
-
-## Roadmap
-
-- Time-series visualization for CEA Patch regions anchored at fixed Carrington coordinates.
-- Natural-language, fuzzy-matched data download and plotting (agent control) — planned, not part of this release.
-
-## Requirements
-
-Python 3.9+ and the packages in `requirements.txt` (installed automatically on first run by the Windows launcher). `tests/verify_ui.py` contains an optional Playwright UI regression suite.
+Time-series visualization for crop regions at fixed Carrington coordinates.
