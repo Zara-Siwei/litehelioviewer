@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import requests
+
 from .config import CACHE_DIR
 from .helioviewer import PRESETS, SERVERS, HelioviewerClient, native_cadence_sec, normalize_date
 
@@ -47,6 +49,31 @@ _MAPPING_KEYS = (
 
 _LOCK = threading.Lock()
 _CANCEL: dict[str, threading.Event] = {}
+
+# Per-step retry policy for transient network failures (SSL EOF, resets,
+# timeouts, 5xx/429). A clean 404 ("no image at this time") is never retried.
+STEP_ATTEMPTS = 3
+STEP_BACKOFF_SECONDS = (1.5, 4.0)
+# After this many consecutive step failures in one member the source is
+# presumed unreachable from this network; stop hammering it and move on.
+MAX_CONSECUTIVE_FAILURES = 6
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Walk the exception chain for network-level failures worth retrying."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, requests.exceptions.HTTPError):
+            status = cur.response.status_code if cur.response is not None else 0
+            return status == 429 or status >= 500
+        if isinstance(cur, (requests.exceptions.SSLError,
+                            requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout)):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 # --- persistence -----------------------------------------------------------
@@ -250,6 +277,29 @@ def cancel_series(series_id: str) -> bool:
     return bool(entry and entry.get("status") == "downloading")
 
 
+def retry_series(series_id: str) -> bool:
+    """Re-run the download worker for a failed/cancelled/gappy series.
+
+    Frames already downloaded are kept and skipped via the requested-date
+    check in _run, so a retry only fetches what is missing. Errors from the
+    previous run are cleared — whatever still fails is recorded again.
+    """
+    entry = get_series(series_id)
+    if entry is None or entry.get("status") == "downloading":
+        return False
+
+    def reset(e: dict[str, Any]) -> None:
+        e.update({"status": "downloading", "error": "", "errors": []})
+        total = int(e.get("progress", {}).get("total") or 0)
+        e["progress"] = {"done": 0, "total": total}
+
+    _mutate(series_id, reset)
+    cancel = threading.Event()
+    _CANCEL[series_id] = cancel
+    threading.Thread(target=_run, args=(series_id, cancel), daemon=True).start()
+    return True
+
+
 def delete_series(series_id: str) -> bool:
     cancel_series(series_id)
     with _LOCK:
@@ -322,28 +372,53 @@ def _run(series_id: str, cancel: threading.Event) -> None:
             except Exception:
                 source_id = int(member.get("sourceId") or PRESETS.get(preset, {}).get("source_id") or 0)
             seen_closest = {str(f.get("closest") or "") for f in member.get("frames") or []}
+            # Steps already downloaded cost zero network on a retry: skip them.
+            seen_requested = {str(f.get("requested") or "") for f in member.get("frames") or []}
+            consecutive_failures = 0
             for step_date in steps:
                 if cancel.is_set():
                     _mutate(series_id, lambda e: e.update({"status": "cancelled"}))
                     return
-                try:
-                    png_path, mapping = client.fetch_jp2_layer(source_id=source_id, date=step_date, preset=preset)
-                    closest = str(mapping.get("closest_date") or step_date)
-                    if closest not in seen_closest:
-                        seen_closest.add(closest)
-                        try:
-                            rel_png = png_path.relative_to(CACHE_DIR).as_posix()
-                        except ValueError:
-                            rel_png = png_path.name
-                        frame = {
-                            "requested": step_date,
-                            "closest": closest,
-                            "png": rel_png,
-                            "mapping": {k: mapping[k] for k in _MAPPING_KEYS if k in mapping},
-                        }
-                        _append_frame(series_id, member_index, frame)
-                except Exception as exc:
-                    _append_error(series_id, member_index, f"{step_date}: {exc}")
+                if step_date in seen_requested:
+                    _bump_progress(series_id)
+                    continue
+                png_path = None
+                mapping: dict[str, Any] = {}
+                last_exc: BaseException | None = None
+                for attempt in range(STEP_ATTEMPTS):
+                    try:
+                        png_path, mapping = client.fetch_jp2_layer(source_id=source_id, date=step_date, preset=preset)
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt + 1 < STEP_ATTEMPTS and _is_transient_error(exc) and not cancel.is_set():
+                            cancel.wait(STEP_BACKOFF_SECONDS[attempt])
+                            continue
+                        break
+                if png_path is None:
+                    consecutive_failures += 1
+                    _append_error(series_id, member_index, f"{step_date}: {last_exc}")
+                    _bump_progress(series_id)
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        _append_error(series_id, member_index,
+                                      "giving up on this layer: the data source seems unreachable from this network — check the connection, then hit Retry")
+                        break
+                    continue
+                consecutive_failures = 0
+                closest = str(mapping.get("closest_date") or step_date)
+                if closest not in seen_closest:
+                    seen_closest.add(closest)
+                    try:
+                        rel_png = png_path.relative_to(CACHE_DIR).as_posix()
+                    except ValueError:
+                        rel_png = png_path.name
+                    frame = {
+                        "requested": step_date,
+                        "closest": closest,
+                        "png": rel_png,
+                        "mapping": {k: mapping[k] for k in _MAPPING_KEYS if k in mapping},
+                    }
+                    _append_frame(series_id, member_index, frame)
                 _bump_progress(series_id)
         _finish(series_id)
     except Exception as exc:  # pragma: no cover - defensive

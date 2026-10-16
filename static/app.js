@@ -1077,6 +1077,10 @@ function renderSeriesList() {
     const actions = [];
     if (item.status === "ready") actions.push(`<button type="button" data-action="load" data-id="${item.id}">Load</button>`);
     if (item.status === "downloading") actions.push(`<button type="button" data-action="cancel" data-id="${item.id}">Cancel</button>`);
+    // Retry re-fetches only the missing frames; useful after a network hiccup.
+    if (item.status === "failed" || item.status === "cancelled" || (item.status === "ready" && item.errors && item.errors.length)) {
+      actions.push(`<button type="button" data-action="retry" data-id="${item.id}" title="Re-download only the missing frames">Retry</button>`);
+    }
     actions.push(`<button type="button" data-action="delete" data-id="${item.id}" title="Remove from the list; downloaded frames stay in the cache">Delete</button>`);
     return `<div class="series-card" data-id="${item.id}">
       <div class="series-card-head"><span class="series-card-name">${escapeHtml(item.name)}</span><span class="series-status ${escapeHtml(item.status)}">${escapeHtml(item.status)}</span></div>
@@ -1095,7 +1099,18 @@ function handleSeriesAction(event) {
   const id = button.dataset.id;
   if (button.dataset.action === "load") loadSeries(id);
   else if (button.dataset.action === "cancel") cancelSeries(id);
+  else if (button.dataset.action === "retry") retrySeries(id);
   else if (button.dataset.action === "delete") deleteSeries(id);
+}
+
+async function retrySeries(seriesId) {
+  try {
+    await api(`/api/series/${seriesId}/retry`, { method: "POST" });
+    appendLog("Series retry started — only missing frames are fetched");
+  } catch (error) {
+    appendLog(error.message, "error");
+  }
+  await refreshSeriesList();
 }
 
 async function loadSeries(seriesId) {

@@ -202,6 +202,13 @@ def series_cancel(series_id: str):
     return {"ok": True}
 
 
+@app.post("/api/series/{series_id}/retry")
+def series_retry(series_id: str):
+    if not series_mod.retry_series(series_id):
+        raise HTTPException(status_code=409, detail="Series not found or already downloading")
+    return {"ok": True, "series": series_mod.list_series()}
+
+
 @app.delete("/api/series/{series_id}")
 def series_delete(series_id: str):
     if not series_mod.delete_series(series_id):

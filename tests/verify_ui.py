@@ -528,8 +528,63 @@ def run() -> None:
                   f"count={page.locator('.layer').count()}")
             check("series bar returns in series mode",
                   page.locator("#seriesBar").is_visible())
+            # Retry semantics: re-running a finished series is idempotent —
+            # frames already on disk are skipped (zero network, no duplicates).
+            counts_before = [m["frames"] for m in s1["members"]]
+            retry_resp = page.evaluate(
+                f"fetch('/api/series/{s1['id']}/retry', {{method:'POST'}}).then(r => r.status)")
+            check("retry endpoint accepts a finished series", retry_resp == 200,
+                  f"status={retry_resp}")
+            s1_retry = wait_series_done(s1_id, timeout=240)
+            counts_after = [m["frames"] for m in (s1_retry or {}).get("members", [])]
+            check("retry re-downloads nothing (no duplicate frames)",
+                  counts_after == counts_before, f"{counts_before} -> {counts_after}")
+            check("series ready again after retry",
+                  bool(s1_retry) and s1_retry["status"] == "ready")
         else:
             check("series 1 load (skipped: download unfinished)", True)
+
+        # A cancelled/failed series card offers Retry, which respawns the
+        # worker; cancel again so the probe does not download 180 real frames.
+        s5_id = None
+        try:
+            resp5 = page.evaluate("""fetch('/api/series', {method:'POST', headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({start:'2013-02-15T06:00:00Z', end:'2013-02-15T12:00:00Z', cadence_sec:120,
+                members:[{preset:'aia-335', server:'GSFC'}]})}).then(r => r.json())""")
+            s5_id = (resp5.get("series") or {}).get("id")
+        except Exception:
+            s5_id = None
+        if s5_id:
+            page.evaluate("refreshSeriesList()") # raw fetch bypasses the UI's own refresh
+            page.evaluate(f"fetch('/api/series/{s5_id}/cancel', {{method:'POST'}})")
+            final5 = wait_series_done(s5_id, timeout=180)
+            status5 = (final5 or {}).get("status")
+            page.evaluate("refreshSeriesList()")
+            check("cancelled series reaches a terminal state",
+                  status5 in ("cancelled", "failed", "ready"), f"status={status5}")
+            retry_btn = page.locator(f".series-card[data-id='{s5_id}'] button[data-action='retry']")
+            if status5 in ("cancelled", "failed"):
+                try:
+                    retry_btn.wait_for(state="attached", timeout=10000)
+                except Exception:
+                    pass
+                check("cancelled/failed card offers Retry", retry_btn.count() == 1)
+                retry_btn.click()
+                page.wait_for_timeout(800)
+                st = (page.evaluate(f"fetch('/api/series/{s5_id}').then(r=>r.json())") or {}).get("status")
+                check("retry respawns the download worker", st == "downloading", f"status={st}")
+                page.evaluate(f"fetch('/api/series/{s5_id}/cancel', {{method:'POST'}})")
+                wait_series_done(s5_id, timeout=180)
+            else:
+                check("cancelled/failed card offers Retry (skipped: finished before cancel)", True)
+                check("retry respawns the download worker (skipped)", True)
+            page.evaluate(f"fetch('/api/series/{s5_id}', {{method:'DELETE'}})")
+            page.evaluate("refreshSeriesList()")
+            page.wait_for_timeout(500)
+        else:
+            check("cancelled series probe (skipped: create rejected)", True)
+            check("cancelled/failed card offers Retry (skipped)", True)
+            check("retry respawns the download worker (skipped)", True)
 
         # 4g-cadence: free-form cadence input — native resolution and clamping.
         # s3: HMI with "native" -> resolves to 45 s (its finest archive cadence).
