@@ -9,7 +9,7 @@ trap {
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $url = "http://127.0.0.1:8765"
-$version = "0.4.15"
+$version = "0.9.2"
 
 Set-Location $root
 $env:PYTHONIOENCODING = "utf-8"

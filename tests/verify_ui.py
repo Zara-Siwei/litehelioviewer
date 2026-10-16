@@ -16,6 +16,7 @@ falls back to a live Helioviewer download and may take longer.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -129,6 +130,26 @@ def run() -> None:
         page.mouse.move(sx, sy, steps=6)
         page.mouse.up()
 
+        # 3a. Whole-panel scrollbar: shrink the panel artificially, then the
+        # LOG at the bottom must become reachable by scrolling.
+        scroll_probe = page.evaluate("""(() => {
+          const panel = document.getElementById('panel');
+          const overflowY = getComputedStyle(panel).overflowY;
+          const prev = panel.style.height;
+          panel.style.height = '320px';
+          const canScroll = panel.scrollHeight > panel.clientHeight + 10;
+          panel.scrollTop = panel.scrollHeight;
+          const rect = document.getElementById('logPanel').getBoundingClientRect();
+          const prect = panel.getBoundingClientRect();
+          const logReachable = rect.bottom <= prect.bottom + 1 && rect.top >= prect.top - 1;
+          panel.style.height = prev;
+          panel.scrollTop = 0;
+          return { overflowY, canScroll, logReachable };
+        })()""")
+        check("panel scrolls as a whole when content overflows",
+              scroll_probe["overflowY"] == "auto" and scroll_probe["canScroll"] and scroll_probe["logReachable"],
+              json.dumps(scroll_probe))
+
         # 4. Load default layer (cached)
         page.click("#addLayer")
         page.wait_for_function("document.getElementById('status').textContent.includes('Layer loaded')", timeout=90000)
@@ -216,6 +237,9 @@ def run() -> None:
         loaded = False
         deadline = time.time() + 90
         while time.time() < deadline:
+            # the status line gets overwritten by the periodic health check,
+            # so completion is detected via the layer count, not the text
+            count = page.evaluate("document.querySelectorAll('.layer').length")
             status_text = page.evaluate("document.getElementById('status').textContent")
             try:
                 with urllib.request.urlopen(f"{URL}api/download/progress", timeout=2) as resp:
@@ -227,7 +251,7 @@ def run() -> None:
                 pass
             if page.locator("#dlProgress").is_visible():
                 chip_shown = True
-            if "Layer loaded" in status_text:
+            if count >= 2:
                 loaded = True
                 break
             if "Download failed" in status_text:
@@ -255,6 +279,810 @@ def run() -> None:
             check("live download progress (skipped: no network)", True, f"status={status_text}")
         page.select_option("#preset", "hmi-magnetogram")
         page.fill("#date", "2013-02-15T12:00")
+        page.wait_for_timeout(400)
+
+        # 4e. Cached-frame loading + multi-epoch Carrington alignment.
+        frames_resp = page.evaluate("fetch('/api/cache/layers').then(r => r.json())")
+        frame_list = frames_resp.get("frames", [])
+        check("cache endpoint lists frames", len(frame_list) >= 2, f"count={len(frame_list)}")
+        check("cache frames carry category", all(f.get("category") for f in frame_list))
+        check("cache frames grouped by source", any(f.get("category") == "SDO / HMI" for f in frame_list))
+        hmi_jp2 = list((ROOT / "data" / "cache").glob("SDO-HMI/Magnetogram/*.jp2"))
+        check("cache files organized in category dirs", len(hmi_jp2) >= 1, f"hmi jp2={len(hmi_jp2)}")
+
+        miss_body = json.dumps({"preset": "hmi-magnetogram", "server": "GSFC",
+                                "date": "1999-01-01T00:00:00Z", "cache_only": True}).encode()
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"{URL}api/load/helioviewer", data=miss_body,
+                headers={"content-type": "application/json"}), timeout=5)
+            miss = 200
+        except urllib.error.HTTPError as exc:
+            miss = exc.code
+        check("cache-only miss returns 404", miss == 404, f"status={miss}")
+
+        page.evaluate(
+            "fetch('/api/load/helioviewer', {method:'POST', headers:{'content-type':'application/json'}, "
+            "body: JSON.stringify({preset:'hmi-magnetogram', server:'GSFC', date:'2011-02-14T00:00:00Z', opacity:1, cache_only:true})})"
+            ".then(r => r.json()).then(d => window.__cachedLoad = d)")
+        page.wait_for_function("window.__cachedLoad && window.__cachedLoad.ok === true", timeout=15000)
+        page.evaluate("refreshLayers()")
+        page.wait_for_function("document.querySelectorAll('.layer').length === 2", timeout=15000)
+        check("cache-only load adds a layer", page.locator(".layer").count() == 2)
+
+        identity = page.evaluate("""(() => {
+          const meta1 = layers[0]?.metadata || {};
+          const f = layerObserverFrame(meta1);
+          return !!f && Math.abs(f.sD) < 1e-12 && Math.abs(f.sbR - f.sbI) < 1e-12;
+        })()""")
+        check("reference layer uses identity frame", bool(identity))
+
+        align = page.evaluate("""(() => {
+          const meta2 = layers[1]?.metadata || {};
+          const helio2 = meta2.heliographic || {};
+          const f = layerObserverFrame(meta2);
+          if (!f) return { ok: false, worst: -1 };
+          const ref = carringtonContext();
+          let worst = 0;
+          for (const [L, B] of [[0, 0], [123.4, -21], [359.9, 7.5], [200, 65], [45, -80]]) {
+            const base = carringtonToBaseVector(L, B, ref.centralLon, ref.centerLat);
+            const got = applyObserverFrame(f, base);
+            const exp = carringtonToBaseVector(L, B, Number(helio2.carrington_lon_obs), Number(helio2.carrington_lat_obs));
+            worst = Math.max(worst, Math.abs(got.x - exp.x), Math.abs(got.y - exp.y), Math.abs(got.z - exp.z));
+          }
+          return { ok: worst < 1e-9, worst };
+        })()""")
+        check("second epoch aligned by Carrington transform", bool(align.get("ok")), f"worst={align.get('worst')}")
+
+        page.wait_for_timeout(800)
+        mean_mixed = center_mean()
+        check("canvas painted with two epochs stacked", mean_mixed > 20, f"mean={mean_mixed:.1f}")
+        page.screenshot(path=str(SHOTS / "shot-03e-multi-epoch.png"))
+
+        # Cache picker: collapsible grouped dropdown (replaces native select).
+        page.evaluate("localStorage.removeItem('lhv.cacheGroups'); cacheGroupsCollapsed = {}; renderCachePicker()")
+        page.click("#cachePickerToggle")
+        page.wait_for_selector("#cachePickerMenu:not([hidden])")
+        item_total = page.locator("#cachePickerMenu .cache-item").count()
+        check("cache picker lists cached frames", item_total >= 2, f"items={item_total}")
+        group_total = page.locator("#cachePickerMenu .cache-group-label").count()
+        check("cache picker grouped by category", group_total >= 1, f"groups={group_total}")
+        page.screenshot(path=str(SHOTS / "shot-03e-cache-picker.png"))
+
+        # Collapse the first group, then expand it again.
+        first_group = page.locator("#cachePickerMenu .cache-group").first
+        first_group.locator(".cache-group-label").click()
+        page.wait_for_timeout(150)
+        visible_after_collapse = page.locator("#cachePickerMenu .cache-item:visible").count()
+        check("group collapses to hide items", visible_after_collapse < item_total,
+              f"visible={visible_after_collapse}/{item_total}")
+        collapsed_class = first_group.get_attribute("class") or ""
+        check("collapsed state marked on group", "collapsed" in collapsed_class)
+        first_group.locator(".cache-group-label").click()
+        page.wait_for_timeout(150)
+        visible_after_expand = page.locator("#cachePickerMenu .cache-item:visible").count()
+        check("group expands again", visible_after_expand == item_total,
+              f"visible={visible_after_expand}/{item_total}")
+
+        idx = page.evaluate("""(() => {
+          const items = [...document.querySelectorAll('#cachePickerMenu .cache-item')];
+          const hit = items.find((el) => el.textContent.includes('2013-02-15'));
+          return hit ? hit.dataset.index : null;
+        })()""")
+        check("target frame present in picker", idx is not None)
+        # The target frame may sit in a collapsed group; expand its group if needed.
+        page.evaluate("""(i) => {
+          const el = document.querySelector(`#cachePickerMenu .cache-item[data-index='${i}']`);
+          const group = el && el.closest('.cache-group');
+          if (group && group.classList.contains('collapsed')) {
+            group.querySelector('.cache-group-label').click();
+          }
+        }""", idx)
+        page.click(f"#cachePickerMenu .cache-item[data-index='{idx}']")
+        toggle_text = page.evaluate("document.getElementById('cachePickerToggle').textContent")
+        check("picker shows selected frame", "2013-02-15" in toggle_text, toggle_text)
+        check("picker closes after selection",
+              page.evaluate("document.getElementById('cachePickerMenu').hidden"))
+        page.click("#loadCached")
+        page.wait_for_function("document.querySelectorAll('.layer').length === 3", timeout=15000)
+        check("cached frame loaded via UI", page.locator(".layer").count() == 3)
+        log_text = page.evaluate("document.getElementById('logPanel').textContent")
+        check("cached load logged", "Load cached:" in log_text)
+
+        page.locator(".layer").nth(2).locator("button[data-action='delete']").click()
+        page.wait_for_function("document.querySelectorAll('.layer').length === 2", timeout=15000)
+        page.locator(".layer").nth(1).locator("button[data-action='delete']").click()
+        page.wait_for_function("document.querySelectorAll('.layer').length === 1", timeout=15000)
+        page.wait_for_timeout(400)
+
+        # 4f. Opacity UX: no slider in New layer; layer slider draggable without DOM rebuild.
+        check("no opacity slider in New layer section",
+              page.evaluate("document.getElementById('opacity') === null"))
+        slider = page.locator(".layer input[data-action='opacity']").first
+        handle = slider.element_handle()
+        box = slider.bounding_box()
+        start_x = box["x"] + box["width"] * 0.98  # thumb sits at the max end (opacity=1)
+        y = box["y"] + box["height"] / 2
+        page.mouse.move(start_x, y)
+        page.mouse.down()
+        page.mouse.move(box["x"] + box["width"] * 0.4, y, steps=8)
+        page.wait_for_timeout(120)
+        mid_opacity = page.evaluate("layers[0] && layers[0].opacity")
+        check("opacity updates live during drag", mid_opacity is not None and 0.2 <= mid_opacity <= 0.6,
+              f"opacity={mid_opacity}")
+        check("slider element survives drag (no list rebuild)",
+              page.evaluate("(el) => el.isConnected", handle))
+        page.mouse.up()
+        page.wait_for_timeout(600)  # change -> PATCH -> refreshLayers
+        srv = page.evaluate("fetch('/api/layers').then(r => r.json())")
+        srv_opacity = srv["layers"][0]["opacity"]
+        check("server opacity synced after drag", abs(srv_opacity - mid_opacity) < 0.05,
+              f"server={srv_opacity}")
+        check("layer count unchanged by opacity drag", len(srv["layers"]) == 1)
+        page.evaluate("""fetch(`/api/layers/${layers[0].id}`, {method:'PATCH',
+          headers:{'content-type':'application/json'}, body: JSON.stringify({opacity: 1})}).then(() => refreshLayers())""")
+        page.wait_for_timeout(400)
+
+        # 4g. Time-series mode: build, download, dedupe, load, scrub.
+        initial_series = len(page.evaluate("fetch('/api/series').then(r => r.json())").get("series", []))
+
+        def wait_series_done(series_id, timeout=120):
+            # Match by id: the library is sorted by first-frame time, so a
+            # pre-existing user series with an earlier start would otherwise
+            # be picked up as items[0] (this actually crashed the suite once).
+            deadline = time.time() + timeout
+            latest = None
+            while time.time() < deadline:
+                data = page.evaluate("fetch('/api/series').then(r => r.json())")
+                items = data.get("series", [])
+                latest = next((it for it in items if it.get("id") == series_id), None)
+                if latest and latest.get("status") in ("ready", "failed", "cancelled"):
+                    return latest
+                time.sleep(1)
+            return latest
+
+        def create_series_and_capture_id(prev_ids):
+            # The frontend sets activeSeriesId from the POST response; wait for
+            # a value that is not one we already created.
+            page.click("#seriesCreate")
+            try:
+                # NOTE: Playwright timeouts are milliseconds — 30_000 ms = 30 s.
+                page.wait_for_function(
+                    f"activeSeriesId && !{json.dumps(list(prev_ids))}.includes(activeSeriesId)",
+                    timeout=30000)
+            except Exception:
+                return None
+            return page.evaluate("activeSeriesId")
+
+        single_layer_count = page.locator(".layer").count()
+        page.click("#modeSeries")
+        check("series mode shows builder", page.locator("#seriesBuilder").is_visible())
+        check("series mode hides single-frame section", not page.locator("#singleSection").is_visible())
+        check("staged list starts empty", "No layers staged" in page.locator("#seriesMembers").text_content())
+        check("series mode shows only its own (empty) layer stack",
+              page.locator(".layer").count() == 0,
+              f"single-frame layers={single_layer_count} must be hidden here")
+
+        # Series 1: 30-second request grid over instruments with ~45 s (HMI)
+        # frame cadence -> several steps collide on the same archive frame and
+        # dedupe must collapse them (9 steps x 2 members = 18 step-visits).
+        page.fill("#seriesStart", "2013-02-15T11:58")
+        page.fill("#seriesEnd", "2013-02-15T12:02")
+        page.select_option("#seriesCadenceUnit", "1")
+        page.fill("#seriesCadenceNum", "30")
+        page.select_option("#seriesServer", "GSFC")
+        page.select_option("#seriesPreset", "hmi-magnetogram")
+        page.click("#seriesAddMember")
+        page.select_option("#seriesPreset", "aia-304")
+        page.click("#seriesAddMember")
+        check("two members staged", page.locator(".series-member").count() == 2)
+        page.click("#seriesAddMember")
+        check("duplicate member rejected", page.locator(".series-member").count() == 2)
+        page.locator(".series-member button[data-idx='1']").click()
+        check("staged member removable", page.locator(".series-member").count() == 1)
+        page.select_option("#seriesPreset", "aia-304")
+        page.click("#seriesAddMember")
+        check("member re-staged", page.locator(".series-member").count() == 2)
+
+        s1_id = create_series_and_capture_id([])
+        s1 = wait_series_done(s1_id, timeout=240) if s1_id else None
+        s1_ready = bool(s1) and s1["status"] == "ready"
+        check("series 1 download finished", s1_ready, f"status={s1 and s1['status']}")
+        if s1_ready:
+            counts1 = [m["frames"] for m in s1["members"]]
+            check("series dedupes repeated closest frames",
+                  0 < counts1[0] < 9 and 0 < counts1[1] <= 9,
+                  f"frames={counts1} from 9 steps each")
+            prog1 = s1.get("progress", {})
+            check("series progress counts every step",
+                  prog1.get("done") == 18 and prog1.get("total") == 18, f"{prog1}")
+        else:
+            check("series 1 dedupe (skipped: download unfinished)", True)
+            check("series 1 progress (skipped: download unfinished)", True)
+
+        before = page.locator(".layer").count()
+        if s1_ready:
+            n1 = s1["members"][0]["frames"]
+            page.locator(f".series-card[data-id='{s1['id']}'] button[data-action='load']").click()
+            page.wait_for_function(f"document.querySelectorAll('.layer').length === {before + 2}", timeout=15000)
+            check("series load adds member layers", page.locator(".layer").count() == before + 2)
+            page.wait_for_selector("#seriesBar:not([hidden])", timeout=15000)
+            check("series bar visible", page.locator("#seriesBar").is_visible())
+            check("series bar shows frame count",
+                  page.locator("#seriesBarCount").text_content().strip() == f"1 / {n1}",
+                  page.locator("#seriesBarCount").text_content().strip())
+            # The two modes own independent stacks: switching to single-frame
+            # must hide the series layers and the scrub bar; switching back
+            # restores them.
+            page.click("#modeSingle")
+            page.wait_for_timeout(400)
+            check("single mode shows its own layers again",
+                  page.locator(".layer").count() == single_layer_count,
+                  f"count={page.locator('.layer').count()} expected={single_layer_count}")
+            check("single mode hides the series bar",
+                  not page.locator("#seriesBar").is_visible())
+            page.click("#modeSeries")
+            page.wait_for_timeout(400)
+            check("series mode restores the series layers",
+                  page.locator(".layer").count() == before + 2,
+                  f"count={page.locator('.layer').count()}")
+            check("series bar returns in series mode",
+                  page.locator("#seriesBar").is_visible())
+        else:
+            check("series 1 load (skipped: download unfinished)", True)
+
+        # 4g-cadence: free-form cadence input — native resolution and clamping.
+        # s3: HMI with "native" -> resolves to 45 s (its finest archive cadence).
+        page.evaluate("stagedMembers = []; renderStagedMembers()")
+        page.fill("#seriesStart", "2013-02-15T11:58")
+        page.fill("#seriesEnd", "2013-02-15T12:00")
+        page.select_option("#seriesCadenceUnit", "native")
+        check("native cadence disables the number input",
+              page.locator("#seriesCadenceNum").is_disabled())
+        page.select_option("#seriesPreset", "hmi-magnetogram")
+        page.click("#seriesAddMember")
+        s3_id = create_series_and_capture_id([x for x in (s1_id,) if x])
+        s3 = wait_series_done(s3_id, timeout=120) if s3_id else None
+        check("native cadence resolves to the source's finest (HMI 45 s)",
+              bool(s3) and s3.get("cadence_sec") == 45,
+              f"cadence={s3 and s3.get('cadence_sec')}")
+        check("native cadence note for the log",
+              bool(s3) and "Default cadence" in (s3.get("cadence_note") or ""),
+              str(s3 and s3.get("cadence_note")))
+        # s4: 5 s is finer than HMI's 45 s -> clamps up, with a note.
+        page.evaluate("stagedMembers = []; renderStagedMembers()")
+        page.select_option("#seriesCadenceUnit", "1")
+        page.fill("#seriesCadenceNum", "5")
+        page.click("#seriesAddMember")
+        s4_id = create_series_and_capture_id([x for x in (s1_id, s3_id) if x])
+        s4 = wait_series_done(s4_id, timeout=120) if s4_id else None
+        check("over-fine cadence clamped to the source's finest",
+              bool(s4) and s4.get("cadence_sec") == 45,
+              f"cadence={s4 and s4.get('cadence_sec')}")
+        check("clamp note explains the adjustment",
+              bool(s4) and "finer" in (s4.get("cadence_note") or ""),
+              str(s4 and s4.get("cadence_note")))
+        if s4_id:
+            card_meta = page.locator(f".series-card[data-id='{s4_id}'] .series-card-meta").text_content()
+            check("series card shows seconds-level cadence", "45 s cadence" in (card_meta or ""),
+                  (card_meta or "").strip())
+        # Drop the two cadence probes again; only s1/s2 continue below.
+        for sid in (s3_id, s4_id):
+            if not sid:
+                continue
+            before_del = page.locator(".series-card").count()
+            page.locator(f".series-card[data-id='{sid}'] button[data-action='delete']").click()
+            page.wait_for_function(
+                f"document.querySelectorAll('.series-card').length === {before_del - 1}", timeout=10000)
+
+        # Series 2: one member, 5 hourly steps -> a scrub-able stack.
+        page.evaluate("stagedMembers = []; renderStagedMembers()")
+        page.fill("#seriesStart", "2013-02-15T09:00")
+        page.fill("#seriesEnd", "2013-02-15T13:00")
+        page.select_option("#seriesCadenceUnit", "3600")
+        page.fill("#seriesCadenceNum", "1")
+        page.select_option("#seriesPreset", "hmi-magnetogram")
+        page.click("#seriesAddMember")
+        s2_id = create_series_and_capture_id([x for x in (s1_id,) if x])
+        s2 = wait_series_done(s2_id, timeout=240) if s2_id else None
+        s2_ready = bool(s2) and s2["status"] == "ready"
+        check("series 2 download finished", s2_ready,
+              f"status={s2 and s2['status']}, errors={s2 and s2.get('errors')}")
+        n2 = (s2 or {"members": [{"frames": 0}]})["members"][0]["frames"]
+        loaded2 = False
+        if s2_ready:
+            page.locator(f".series-card[data-id='{s2['id']}'] button[data-action='load']").click()
+            page.wait_for_function(
+                f"document.querySelectorAll('.layer').length === {before + (3 if s1_ready else 1)}",
+                timeout=15000)
+            page.wait_for_selector("#seriesBar:not([hidden])", timeout=15000)
+            page.wait_for_timeout(400)
+            loaded2 = True
+            check("series bar shows step count",
+                  page.locator("#seriesBarCount").text_content().strip() == f"1 / {n2}")
+
+        if loaded2:
+            # History persistence: the record is on disk, sorted by first-frame
+            # time, and a brand-new backend process over the same cache can
+            # rebuild a layer from it without any network (cache_only).
+            persisted_raw = (ROOT / "data" / "cache" / "series.json").read_text(encoding="utf-8")
+            persisted = json.loads(persisted_raw)
+            recs = persisted.get("series", []) if isinstance(persisted, dict) else []
+            rec = next((r for r in recs if r.get("id") == s2["id"]), None)
+            rec_frames = len((rec.get("members") or [{}])[0].get("frames") or []) if rec else 0
+            check("series record persisted to disk", rec is not None and rec_frames == n2,
+                  f"frames={rec_frames}")
+            starts = [str(r.get("start") or "") for r in recs]
+            check("series history sorted by first-frame time", starts == sorted(starts),
+                  f"starts={starts}")
+            proc2 = subprocess.Popen(
+                [PYTHON, "-m", "litehelioviewer_app.cli", "serve", "--host", "127.0.0.1", "--port", "8768"],
+                cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                healthy2 = False
+                for _ in range(60):
+                    try:
+                        with urllib.request.urlopen("http://127.0.0.1:8768/api/health", timeout=1) as resp:
+                            if resp.status == 200:
+                                healthy2 = True
+                                break
+                    except Exception:
+                        pass
+                    if proc2.poll() is not None:
+                        break
+                    time.sleep(0.5)
+                check("second backend (restart simulation) started", healthy2)
+                if healthy2:
+                    with urllib.request.urlopen("http://127.0.0.1:8768/api/series", timeout=5) as resp:
+                        data2 = json.loads(resp.read().decode("utf-8"))
+                    rec2 = next((r for r in data2.get("series", []) if r.get("id") == s2["id"]), None)
+                    check("series survives backend restart", rec2 is not None and rec2.get("status") == "ready",
+                          f"status={rec2 and rec2.get('status')}")
+                    starts2 = [str(r.get("start") or "") for r in data2.get("series", [])]
+                    check("restarted backend lists series chronologically", starts2 == sorted(starts2),
+                          f"starts={starts2}")
+                    member0 = (rec.get("members") or [{}])[0]
+                    f0 = (member0.get("frames") or [{}])[0]
+                    body = json.dumps({"preset": member0.get("preset"), "server": member0.get("server"),
+                                       "date": f0.get("requested"), "closest": f0.get("closest"),
+                                       "opacity": 1, "cache_only": True}).encode()
+                    req = urllib.request.Request("http://127.0.0.1:8768/api/load/helioviewer", data=body,
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        load2 = json.loads(resp.read().decode("utf-8"))
+                    check("first frame rebuilt from history in fresh process",
+                          bool((load2.get("layer") or {}).get("id")),
+                          str((load2.get("layer") or {}).get("id")))
+            finally:
+                stop_backend(proc2)
+
+        if loaded2:
+            # Reveal the bar first: it auto-hides when the mouse is away.
+            page.evaluate("revealSeriesBar()")
+            page.wait_for_timeout(400)
+            geom = page.evaluate("""(() => {
+              const bar = document.getElementById('seriesBar').getBoundingClientRect();
+              const ro = document.getElementById('coordReadout').getBoundingClientRect();
+              const cs = getComputedStyle(document.getElementById('coordReadout'));
+              const fps = document.getElementById('seriesFps').getBoundingClientRect();
+              const viewer = document.getElementById('dropZone').getBoundingClientRect();
+              const barCenter = (bar.left + bar.right) / 2;
+              const viewerCenter = (viewer.left + viewer.right) / 2;
+              return { centerDelta: Math.abs(barCenter - viewerCenter),
+                       borderStyle: cs.borderStyle, bg: cs.backgroundColor,
+                       bottomGap: Math.abs(bar.bottom - ro.bottom), fpsW: fps.width };
+            })()""")
+            check("series bar horizontally centered in the viewer", geom["centerDelta"] < 40,
+                  json.dumps(geom))
+            check("coord readout is borderless text",
+                  geom["borderStyle"] == "none" and geom["bg"] == "rgba(0, 0, 0, 0)",
+                  f"border={geom['borderStyle']} bg={geom['bg']}")
+            check("series bar and readout bottoms aligned", geom["bottomGap"] < 2,
+                  f"gap={geom['bottomGap']:.1f}")
+            check("fps select is narrow", geom["fpsW"] < 90, f"w={geom['fpsW']:.0f}")
+            # Auto-hide: mouse away from the bottom conceals the bar, hovering
+            # near the bottom edge reveals it again.
+            page.mouse.move(800, 200)
+            page.wait_for_timeout(1300)
+            check("series bar auto-hides when mouse away",
+                  page.evaluate("document.getElementById('seriesBar').classList.contains('concealed')"))
+            page.mouse.move(800, 970)
+            page.wait_for_timeout(500)
+            check("series bar reveals near the bottom edge",
+                  not page.evaluate("document.getElementById('seriesBar').classList.contains('concealed')"))
+
+        if loaded2 and n2 >= 3:
+            check("series 2 downloaded a scrub-able stack", True, f"frames={n2}")
+            d2 = page.evaluate(f"fetch('/api/series/{s2['id']}').then(r => r.json())")
+            frames2 = (d2.get("members") or [{}])[0].get("frames", [])
+            last_hm = frames2[-1]["closest"][11:16] if frames2 else ""
+            badge0 = page.locator(".layer").last.locator(".layer-date").text_content()
+            page.evaluate("""(n) => {
+              const s = document.getElementById('seriesScrub');
+              s.value = String(n);
+              s.dispatchEvent(new Event('input', {bubbles: true}));
+            }""", n2 - 1)
+            page.wait_for_timeout(1500)
+            badge1 = page.locator(".layer").last.locator(".layer-date").text_content()
+            check("scrub updates layer date badge", badge0 != badge1 and last_hm in badge1,
+                  f"{badge0.strip()} -> {badge1.strip()} (expect {last_hm})")
+            check("series bar follows scrub",
+                  page.locator("#seriesBarCount").text_content().strip() == f"{n2} / {n2}")
+            check("series bar time follows scrub",
+                  last_hm in page.locator("#seriesBarTime").text_content())
+            mean_series = center_mean()
+            check("canvas painted after scrub", mean_series > 20, f"mean={mean_series:.1f}")
+            # First-play flash guard: scrubbing to a frame whose texture is not
+            # decoded yet must keep the previous frame on screen and swap the
+            # new frame in once its texture arrives (no background flash).
+            swap_probe = page.evaluate("""(() => {
+              const pair = [...seriesLayers.entries()].filter(([, e]) => e.seriesId === activeSeriesId)[0];
+              const [layerId, entry] = pair;
+              const layer = layers.find((l) => l.id === layerId);
+              scrubSeriesTo(0);
+              const url0 = `/data/cache/${entry.frames[0].png}`;
+              const url1 = `/data/cache/${entry.frames[1].png}`;
+              imageCache.delete(url1); // simulate a cold, not-yet-decoded frame
+              scrubSeriesTo(1);
+              return { url0, url1, after: layer.image_url, layerId };
+            })()""")
+            check("scrub keeps previous frame while target texture decodes",
+                  swap_probe["after"] == swap_probe["url0"],
+                  f"after={swap_probe['after']}")
+            page.wait_for_timeout(1500)
+            check("frame swaps in once the texture is decoded",
+                  page.evaluate(
+                      f"(layers.find((l) => l.id === '{swap_probe['layerId']}') || {{}}).image_url"
+                  ) == swap_probe["url1"],
+                  f"expect {swap_probe['url1']}")
+            page.evaluate(f"scrubSeriesTo({n2 - 1})") # restore for the playback block
+            page.wait_for_timeout(300)
+            page.screenshot(path=str(SHOTS / "shot-03g-series.png"))
+        else:
+            check("series 2 scrub (skipped: no scrub-able stack)", True, f"frames={n2}")
+            page.screenshot(path=str(SHOTS / "shot-03g-series.png"))
+
+        # 4h. Series playback: play/pause toggle, wrap-around, fps, step buttons.
+        if loaded2 and n2 >= 3:
+            def s2_index():
+                return page.evaluate(
+                    "[...seriesLayers.entries()].filter(([, e]) => e.seriesId === activeSeriesId)[0][1].index"
+                )
+
+            check("play button rendered",
+                  page.locator("#seriesPlay").is_visible()
+                  and page.locator("#seriesPlay").text_content().strip() == "▶")
+            page.click("#seriesStepNext")
+            page.wait_for_timeout(250)
+            check("step next clamps at last frame", s2_index() == n2 - 1, f"index={s2_index()}")
+            page.click("#seriesStepPrev")
+            page.wait_for_timeout(250)
+            check("step prev moves one frame back", s2_index() == n2 - 2, f"index={s2_index()}")
+            page.select_option("#seriesFps", "10")
+            # Start from the last frame so the wrap-around is observable.
+            page.evaluate("""(n) => {
+              const s = document.getElementById('seriesScrub');
+              s.value = String(n);
+              s.dispatchEvent(new Event('input', {bubbles: true}));
+            }""", n2 - 1)
+            page.wait_for_timeout(200)
+            page.click("#seriesPlay")
+            page.wait_for_timeout(200)
+            check("playback starts", page.evaluate("isSeriesPlaying()") is True)
+            check("play button toggles to pause glyph",
+                  page.locator("#seriesPlay").text_content().strip() == "❚❚")
+            wrapped = False
+            try:
+                page.wait_for_function(
+                    f"[...seriesLayers.entries()].filter(([, e]) => e.seriesId === activeSeriesId)[0][1].index < {n2 - 1}",
+                    timeout=4000)
+                wrapped = True
+            except Exception:
+                pass
+            check("playback wraps past the last frame", wrapped, f"index={s2_index()}")
+            page.screenshot(path=str(SHOTS / "shot-03h-series-play.png"))
+            page.click("#seriesPlay")
+            page.wait_for_timeout(150)
+            check("playback pauses", page.evaluate("isSeriesPlaying()") is False)
+            held = s2_index()
+            page.wait_for_timeout(500)
+            check("paused playback holds its frame", s2_index() == held, f"{held} -> {s2_index()}")
+            page.click("#seriesPlay")
+            page.wait_for_timeout(300)
+            page.evaluate("""() => {
+              const s = document.getElementById('seriesScrub');
+              s.value = "0";
+              s.dispatchEvent(new Event('input', {bubbles: true}));
+            }""")
+            check("manual scrub pauses playback", page.evaluate("isSeriesPlaying()") is False)
+        else:
+            check("series playback (skipped: no scrub-able stack)", True)
+
+        # 4i. CEA crop on a loaded series: Carrington-anchored patch follows frames.
+        if loaded2 and n2 >= 3:
+            def crop_sig():
+                return page.evaluate("""(() => {
+                  const r = cropRegions[0];
+                  if (!r || !r.image) return null;
+                  const d = r.image.data;
+                  let s = 0, n = 0;
+                  const probe = [];
+                  for (let i = 0; i < d.length; i += 1604) {
+                    s += d[i]; n += 1;
+                    if (probe.length < 48) probe.push(d[i]);
+                  }
+                  return { mean: s / n, w: r.image.width, probe: probe.join(","),
+                           lon: r.center.lon, lat: r.center.lat,
+                           central: r.frame.centralLon };
+                })()""")
+
+            # Make the series member the viewpoint layer (first visible image
+            # layer defines the base frame), so the crop ephemeris must follow
+            # the scrubbed frame rather than a static stack below.
+            page.evaluate("""(() => {
+              for (let i = 0; i < layers.length - 1; i++) layers[i].visible = false;
+            })()""")
+            page.click("#cropMode")
+            rect = page.evaluate("(() => { const r = document.getElementById('sun').getBoundingClientRect(); return {x: r.x, y: r.y, w: r.width, h: r.height}; })()")
+            ccx = rect["x"] + rect["w"] / 2
+            ccy = rect["y"] + rect["h"] / 2
+            page.mouse.move(ccx - 100, ccy - 70)
+            page.mouse.down()
+            page.mouse.move(ccx + 100, ccy + 70, steps=10)
+            page.mouse.up()
+            page.wait_for_timeout(700)
+            check("crop drawn on loaded series", page.locator("#cropDock").is_visible()
+                  and page.locator(".crop-tab").count() == 1)
+            sig0 = crop_sig()
+            check("crop patch rendered", bool(sig0) and sig0["mean"] > 3,
+                  f"mean={sig0 and round(sig0['mean'], 1)}")
+            # Scrub to the last frame: patch must stay Carrington-anchored but
+            # re-render against the new ephemeris and the new frame's pixels.
+            page.evaluate("""(n) => {
+              const s = document.getElementById('seriesScrub');
+              s.value = String(n);
+              s.dispatchEvent(new Event('input', {bubbles: true}));
+            }""", n2 - 1)
+            page.wait_for_timeout(1500)
+            sig1 = crop_sig()
+            check("crop Carrington anchor fixed across frames",
+                  bool(sig0) and bool(sig1)
+                  and abs(sig0["lon"] - sig1["lon"]) < 1e-9
+                  and abs(sig0["lat"] - sig1["lat"]) < 1e-9)
+            check("crop ephemeris follows the frame",
+                  bool(sig0) and bool(sig1) and abs(sig1["central"] - sig0["central"]) > 0.01,
+                  f"L0 {sig0 and round(sig0['central'], 3)} -> {sig1 and round(sig1['central'], 3)}")
+            check("crop patch re-rendered for the new frame",
+                  bool(sig0) and bool(sig1) and sig0["probe"] != sig1["probe"])
+            page.screenshot(path=str(SHOTS / "shot-03i-series-crop.png"))
+            # Playback renders the patch lighter; pausing restores full detail.
+            page.select_option("#seriesFps", "10")
+            page.click("#seriesPlay")
+            page.wait_for_timeout(800)
+            play_w = (crop_sig() or {}).get("w", 0)
+            page.click("#seriesPlay")
+            page.wait_for_timeout(500)
+            pause_w = (crop_sig() or {}).get("w", 0)
+            check("playback renders patch lighter, pause restores",
+                  0 < play_w < pause_w, f"w {play_w} -> {pause_w}")
+
+            # 4j. View toggles + series export: one zip of full-res PNGs.
+            # localStorage persists across runs — force a known state first.
+            page.evaluate("""(() => {
+              localStorage.setItem('lhv.grid', '1');
+              showGrid = true;
+              document.getElementById('toggleGrid').checked = true;
+            })()""")
+            check("grid toggle defaults on", page.locator("#toggleGrid").is_checked())
+            page.click("#toggleGrid")
+            check("grid toggle hides grid", page.evaluate("showGrid") is False)
+            page.click("#toggleGrid")
+            check("grid toggle restores grid", page.evaluate("showGrid") is True)
+            # Crosshair toggle lives in the crop dock and gates the green
+            # center cross on the patch. The cross sits at the *plot* centre
+            # (axes margins offset it from the canvas middle), so probe the
+            # whole canvas for green-dominant pixels instead of one band.
+            page.evaluate("""(() => {
+              localStorage.setItem('lhv.cropCross', '1');
+              showCropCross = true;
+              document.getElementById('toggleCropCross').classList.add('active');
+              renderCropCanvas();
+            })()""")
+            green_row = """(() => {
+              const c = document.getElementById('cropCanvas');
+              const ctx = c.getContext('2d');
+              const img = ctx.getImageData(0, 0, c.width, c.height).data;
+              let n = 0;
+              for (let i = 0; i < c.width * c.height; i++) {
+                const r = img[i * 4], g = img[i * 4 + 1], b = img[i * 4 + 2];
+                if (g > r + 12 && g > b + 12) n++;
+              }
+              return n;
+            })()"""
+            g_on = page.evaluate(green_row)
+            check("crosshair toggle defaults on", page.locator("#toggleCropCross.active").count() == 1)
+            check("crosshair paints the center cross", g_on > 100, f"green px={g_on}")
+            page.click("#toggleCropCross")
+            page.wait_for_timeout(300)
+            g_off = page.evaluate(green_row)
+            check("crosshair toggle hides the cross", g_off < max(10, g_on // 10), f"green px={g_off}")
+            page.click("#toggleCropCross")
+            page.wait_for_timeout(300)
+            check("crosshair toggle restores the cross", page.evaluate(green_row) > 100)
+
+            pre_export = s2_index()
+            page.click("#cropExportBtn")
+            page.wait_for_timeout(150)
+            check("sequence export offered for loaded series",
+                  page.locator("#cropExportSeq").is_visible())
+            with page.expect_download(timeout=45000) as seq_info:
+                page.click("#cropExportSeq")
+            seq_dl = seq_info.value
+            zip_path = SHOTS / seq_dl.suggested_filename
+            seq_dl.save_as(str(zip_path))
+            check("sequence export is a zip", seq_dl.suggested_filename.endswith("_sequence.zip"),
+                  seq_dl.suggested_filename)
+            import zipfile
+            with zipfile.ZipFile(str(zip_path)) as zf:
+                names = zf.namelist()
+                bad = zf.testzip()
+            check("zip holds one png per frame",
+                  len(names) == n2 and all(n.endswith(".png") for n in names), f"{len(names)} entries")
+            check("zip integrity ok", bad is None, f"bad={bad}")
+            check("sequence export restores scrub position",
+                  s2_index() == pre_export, f"{pre_export} -> {s2_index()}")
+
+            # 4k. Line analysis across the series: any frame or the whole stack.
+            page.click("#sideTabAnalysis")
+            page.click("#addLineBtn")
+            page.wait_for_timeout(200)
+            options = page.locator("#lineLayerSelect option").all_text_contents()
+            check("line setup offers whole-series choice",
+                  any("whole series" in o for o in options), str(options[:3]))
+            check("line setup offers per-frame choices",
+                  any("UTC" in o for o in options), str(options[:2]))
+            # Whole-series line on the active (last loaded = last option) member.
+            page.evaluate("""(() => {
+              const sel = document.getElementById('lineLayerSelect');
+              const hits = [...sel.options].filter(o => o.value.endsWith('|series'));
+              sel.value = hits[hits.length - 1].value;
+            })()""")
+            cbox = page.locator("#cropCanvas").bounding_box()
+            lcx = cbox["x"] + cbox["width"] * 0.5
+            lcy = cbox["y"] + cbox["height"] * 0.5
+            page.click("#lineModeFreehand")
+            page.wait_for_timeout(150)
+            page.mouse.move(lcx - 60, lcy - 20)
+            page.mouse.down()
+            page.mouse.move(lcx - 20, lcy + 25, steps=6)
+            page.mouse.move(lcx + 60, lcy + 10, steps=6)
+            page.mouse.up()
+            page.wait_for_timeout(200)
+            if page.locator("#smoothPrompt").is_visible():
+                page.click("#smoothYes")
+            page.wait_for_timeout(300)
+            check("series line stored", page.evaluate("activeCrop().lines.length") == 1)
+            page.click(".line-row .line-plot")
+            page.wait_for_function("activeCrop().lines[0].plotStrip !== null", timeout=30000)
+            dims = page.evaluate("({w: activeCrop().lines[0].plotStrip.width, h: activeCrop().lines[0].plotStrip.height})")
+            check("time-distance mosaic is a plain 2:1 image", dims["w"] == 640 and dims["h"] == 320,
+                  f"{dims['w']}x{dims['h']}")
+            chart_w = page.evaluate("activeCrop().lines[0].plotChart.width")
+            check("light curve chart rendered", chart_w == 640, f"w={chart_w}")
+            title0 = page.locator(".line-row .line-title").first.text_content()
+            check("line row tagged whole series", "whole series" in title0, title0.strip())
+            diag = page.evaluate("""(() => {
+              const rows = [...document.querySelectorAll('.line-row')];
+              const line = activeCrop().lines[0];
+              const row = rows[0];
+              const strip = row.querySelector('.strip-canvas');
+              const chart = row.querySelector('.chart-canvas');
+              const cs = getComputedStyle(strip);
+              return {
+                rows: rows.length, rowH: row.offsetHeight, rowClass: row.className,
+                stripHidden: strip.hidden, stripClass: strip.className, stripDisplay: cs.display,
+                stripAttr: [strip.width, strip.height], stripCss: [strip.offsetWidth, strip.offsetHeight],
+                chartHidden: chart.hidden, chartCss: [chart.offsetWidth, chart.offsetHeight],
+                timeMode: line.timeMode,
+              };
+            })()""")
+            check("strip canvas visible in row", not diag["stripHidden"] and diag["stripCss"][1] > 80,
+                  json.dumps(diag))
+            check("stack class applied", "stack" in diag["stripClass"], diag["stripClass"])
+            check("chart canvas visible in row", not diag["chartHidden"] and diag["chartCss"][1] > 40,
+                  json.dumps({k: diag[k] for k in ("chartHidden", "chartCss")}))
+            for tag, key in (("strip", "plotStrip"), ("chart", "plotChart")):
+                data_url = page.evaluate(f"activeCrop().lines[0].{key}.toDataURL()")
+                (SHOTS / f"shot-03k-series-{tag}.png").write_bytes(
+                    base64.b64decode(data_url.split(",", 1)[1]))
+            page.locator(".line-row").first.screenshot(path=str(SHOTS / "shot-03j-series-stack.png"))
+            # Side panel (Info/Analysis) is width-draggable via its left edge.
+            side0 = page.evaluate("document.querySelector('.crop-side').getBoundingClientRect().width")
+            hbox = page.locator("#cropSideResize").bounding_box()
+            hx = hbox["x"] + hbox["width"] / 2
+            hy = hbox["y"] + hbox["height"] / 2
+            page.mouse.move(hx, hy)
+            page.mouse.down()
+            page.mouse.move(hx - 90, hy, steps=5)
+            page.mouse.up()
+            page.wait_for_timeout(300)
+            side1 = page.evaluate("document.querySelector('.crop-side').getBoundingClientRect().width")
+            check("crop side panel widened by drag", side1 > side0 + 60, f"{side0:.0f} -> {side1:.0f}")
+            page.mouse.move(hx - 90, hy)
+            page.mouse.down()
+            page.mouse.move(hx, hy, steps=5)
+            page.mouse.up()
+            page.wait_for_timeout(300)
+            side2 = page.evaluate("document.querySelector('.crop-side').getBoundingClientRect().width")
+            check("crop side panel restored by drag back", abs(side2 - side0) < 24, f"{side2:.0f}")
+            # Single-frame choice: sample exactly one downloaded frame.
+            page.click("#addLineBtn")
+            page.wait_for_timeout(200)
+            page.evaluate("""(() => {
+              const sel = document.getElementById('lineLayerSelect');
+              const hits = [...sel.options].filter(o => o.value.endsWith('|frame:2'));
+              sel.value = hits[hits.length - 1].value;
+            })()""")
+            page.click("#lineModeFreehand")
+            page.wait_for_timeout(150)
+            page.mouse.move(lcx - 50, lcy + 40)
+            page.mouse.down()
+            page.mouse.move(lcx + 10, lcy + 60, steps=6)
+            page.mouse.move(lcx + 55, lcy + 35, steps=6)
+            page.mouse.up()
+            page.wait_for_timeout(200)
+            if page.locator("#smoothPrompt").is_visible():
+                page.click("#smoothNo")
+            page.wait_for_timeout(300)
+            check("frame line stored", page.evaluate("activeCrop().lines.length") == 2)
+            page.locator(".line-row .line-plot").last.click()
+            page.wait_for_function("activeCrop().lines[1].plotStrip !== null", timeout=30000)
+            fw = page.evaluate("activeCrop().lines[1].plotStrip.width")
+            check("single-frame strip is the classic wide strip", fw == 640, f"w={fw}")
+            title1 = page.locator(".line-row .line-title").nth(1).text_content()
+            check("frame line tagged with its UTC time", "UTC" in title1, title1.strip())
+            # Leave no trace for the single-frame crop tests below.
+            page.locator(".crop-tab-close[data-action='close']").first.click()
+            page.wait_for_timeout(300)
+            check("series crop closed", page.locator(".crop-tab").count() == 0)
+            page.click("#cropMode")
+            page.evaluate("""(() => {
+              for (let i = 0; i < layers.length - 1; i++) layers[i].visible = true;
+            })()""")
+        else:
+            check("series crop follow (skipped: no scrub-able stack)", True)
+
+        # Opacity still adjustable on a series member layer.
+        if page.locator(".layer").count() > before:
+            page.evaluate("""(() => {
+              const sliders = document.querySelectorAll(".layer input[data-action='opacity']");
+              const s = sliders[sliders.length - 1];
+              s.value = "0.5";
+              s.dispatchEvent(new Event("input", {bubbles: true}));
+              s.dispatchEvent(new Event("change", {bubbles: true}));
+            })()""")
+            page.wait_for_timeout(700)
+            srv = page.evaluate("fetch('/api/layers').then(r => r.json())")
+            check("series layer opacity adjustable",
+                  abs(srv["layers"][-1]["opacity"] - 0.5) < 0.01,
+                  f"opacity={srv['layers'][-1]['opacity']}")
+        else:
+            check("series layer opacity (skipped: nothing loaded)", True)
+
+        # Cleanup: drop whichever series layers were added, then the records.
+        current = page.locator(".layer").count()
+        for target in range(current - 1, before - 1, -1):
+            page.locator(".layer").last.locator("button[data-action='delete']").click()
+            page.wait_for_function(f"document.querySelectorAll('.layer').length === {target}", timeout=15000)
+        check("series bar hides when layers gone", not page.locator("#seriesBar").is_visible())
+        for sid, expected in ((s2 and s2["id"], initial_series + 1), (s1 and s1["id"], initial_series)):
+            if not sid:
+                continue
+            page.locator(f".series-card[data-id='{sid}'] button[data-action='delete']").click()
+            page.wait_for_function(f"document.querySelectorAll('.series-card').length === {expected}", timeout=10000)
+        check("series records deleted", page.locator(".series-card").count() == initial_series)
+        page.click("#modeSingle")
+        check("single-frame mode restored", page.locator("#singleSection").is_visible())
         page.wait_for_timeout(400)
 
         # 5. Crop mode: drag a region on the disk
@@ -735,11 +1563,20 @@ def run() -> None:
 
 def main() -> int:
     SHOTS.mkdir(exist_ok=True)
+    # The suite shares the real cache dir (for fast cached loads). Snapshot the
+    # user's series history and restore it after the run so tests never destroy
+    # it — earlier runs deleted series.json outright and wiped real history.
+    series_json = ROOT / "data" / "cache" / "series.json"
+    series_backup = series_json.read_bytes() if series_json.exists() else None
     backend = start_backend()
     try:
         run()
     finally:
         stop_backend(backend)
+        if series_backup is None:
+            series_json.unlink(missing_ok=True)
+        else:
+            series_json.write_bytes(series_backup)
 
     print()
     failed = [r for r in results if not r[1]]

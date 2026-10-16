@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>LiteHelioviewer</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/style.css?v=0.4.15" />
+    <link rel="stylesheet" href="/static/style.css?v=0.9.2" />
   </head>
   <body>
     <aside class="panel" id="panel">
@@ -20,7 +20,12 @@
         </div>
       </div>
 
-      <section class="section">
+      <nav class="mode-switch" id="modeSwitch" aria-label="Panel mode">
+        <button id="modeSingle" class="active" type="button">Single frame</button>
+        <button id="modeSeries" type="button">Time series</button>
+      </nav>
+
+      <section class="section" id="singleSection">
         <h2>New layer</h2>
         <label>
           Server
@@ -34,11 +39,57 @@
           UTC time
           <input id="date" type="datetime-local" step="1" />
         </label>
-        <label>
-          Opacity
-          <input id="opacity" type="range" min="0" max="1" step="0.01" value="1" />
-        </label>
         <button id="addLayer" class="primary">Add Helioviewer layer</button>
+        <div class="cache-row">
+          <div id="cachePicker" class="cache-picker">
+            <button id="cachePickerToggle" class="cache-picker-toggle" type="button" title="Previously downloaded frames">No cached frames</button>
+            <div id="cachePickerMenu" class="cache-picker-menu" hidden></div>
+          </div>
+          <button id="loadCached" title="Load the selected frame from the local cache (no download)">Load cached</button>
+        </div>
+      </section>
+
+      <section class="section" id="seriesBuilder" hidden>
+        <h2>Time series</h2>
+        <label>
+          Start UTC
+          <input id="seriesStart" type="datetime-local" step="1" />
+        </label>
+        <label>
+          End UTC
+          <input id="seriesEnd" type="datetime-local" step="1" />
+        </label>
+        <div class="cadence-field">
+          <span class="cadence-title">Cadence</span>
+          <div class="cadence-row">
+            <input id="seriesCadenceNum" type="number" min="1" max="999" step="1" value="1" disabled />
+            <select id="seriesCadenceUnit" title="Default = the finest cadence the selected data source itself offers">
+              <option value="native" selected>Default (finest)</option>
+              <option value="1">sec</option>
+              <option value="60">min</option>
+              <option value="3600">hour</option>
+              <option value="86400">day</option>
+            </select>
+          </div>
+        </div>
+        <div class="series-stage">
+          <label>
+            Server
+            <select id="seriesServer"></select>
+          </label>
+          <label>
+            Data
+            <select id="seriesPreset"></select>
+          </label>
+          <button id="seriesAddMember" type="button" title="Stage this layer for the series">+ Layer</button>
+        </div>
+        <div id="seriesMembers" class="series-members"></div>
+        <button id="seriesCreate" class="primary" type="button" title="Start downloading the whole time series">Add timeseries</button>
+      </section>
+
+      <section class="section" id="seriesLibrary" hidden>
+        <h2>Saved series</h2>
+        <div id="seriesList" class="series-list"></div>
       </section>
 
       <section class="section row-actions">
@@ -47,6 +98,10 @@
         <button id="cropMode">Crop</button>
         <button id="clearLayers">Clear</button>
         <input id="fitsInput" type="file" accept=".fits,.fit,.fts" hidden />
+      </section>
+
+      <section class="section view-toggles">
+        <label class="view-toggle" title="Stonyhurst grid on the solar disk"><input id="toggleGrid" type="checkbox" checked /> Grid</label>
       </section>
 
       <section class="section layers-section">
@@ -79,6 +134,24 @@
           <span class="dl-progress-track"><span id="dlProgressBar" class="dl-progress-bar"></span></span>
           <span id="dlProgressText" class="dl-progress-text"></span>
         </div>
+        <div id="seriesBar" class="series-bar" hidden>
+          <div class="series-controls">
+            <button id="seriesPlay" class="series-play" type="button" title="Play">▶</button>
+            <button id="seriesStepPrev" class="series-step" type="button" title="Previous frame">‹</button>
+            <button id="seriesStepNext" class="series-step" type="button" title="Next frame">›</button>
+          </div>
+          <span id="seriesBarName" class="series-bar-name" title=""></span>
+          <input id="seriesScrub" type="range" min="0" max="0" step="1" value="0" />
+          <span id="seriesBarTime" class="series-bar-time"></span>
+          <span id="seriesBarCount" class="series-bar-count"></span>
+          <select id="seriesFps" class="series-fps" title="Playback speed">
+            <option value="1">1 fps</option>
+            <option value="2">2 fps</option>
+            <option value="5" selected>5 fps</option>
+            <option value="10">10 fps</option>
+            <option value="20">20 fps</option>
+          </select>
+        </div>
       </div>
       <button id="showCropDock" class="crop-show" hidden>Crops</button>
 
@@ -88,6 +161,7 @@
           <div id="cropTabs" class="crop-tabs"></div>
           <div class="crop-actions">
             <button id="toggleCropRegion" title="Hide/show the active crop region on the solar disk">Hide region</button>
+            <button id="toggleCropCross" class="active" title="Hide/show the center crosshair on the crop image">Crosshair</button>
             <button id="resetCropView" title="Reset crop zoom and pan">Reset</button>
             <button id="hideCropDock" title="Collapse crop window">Collapse</button>
             <button id="clearCrops" title="Clear CEA crops">Clear</button>
@@ -101,9 +175,11 @@
               <div id="cropExportMenu" class="crop-export-menu" hidden>
                 <button type="button" data-fmt="png">PNG</button>
                 <button type="button" data-fmt="jpg">JPG</button>
+                <button type="button" data-fmt="seq" id="cropExportSeq" hidden>PNG sequence (all frames)</button>
               </div>
             </div>
           </div>
+          <div id="cropSideResize" class="crop-side-resize" title="Drag to resize side panel"></div>
           <aside class="crop-side">
             <div class="side-tabs">
               <button id="sideTabInfo" class="side-tab active" type="button">Info</button>
@@ -139,6 +215,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=0.4.15"></script>
+    <script src="/static/app.js?v=0.9.2"></script>
   </body>
 </html>

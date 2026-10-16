@@ -13,14 +13,18 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import __version__, progress
+from . import __version__, progress, series as series_mod
 from .config import DATA_DIR, STATIC_DIR, UPLOAD_DIR
 from .fits_utils import fits_to_png
 from .helioviewer import (
     PRESETS,
     SERVERS,
     HelioviewerClient,
+    cached_layer_lookup_by_closest,
     closest_delta_seconds,
+    list_cached_frames,
+    migrate_cache_layout,
+    normalize_api_date,
     normalize_date,
     server_fallback_order,
 )
@@ -37,6 +41,18 @@ app.add_middleware(
 )
 app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# Reorganize any flat-layout cache from older versions into category subdirs.
+try:
+    migrate_cache_layout()
+except Exception as exc:  # never let housekeeping break startup
+    print(f"cache migration skipped: {exc}", flush=True)
+
+# A series left in 'downloading' by a previous process can never finish.
+try:
+    series_mod.reset_stale_downloads()
+except Exception as exc:
+    print(f"series housekeeping skipped: {exc}", flush=True)
 
 _samp_bridge: SampBridge | None = None
 
@@ -112,12 +128,22 @@ class HelioviewerLoad(BaseModel):
     opacity: float = 1.0
     width: int = 1024
     height: int = 1024
+    cache_only: bool = False
+    closest: str | None = None
+    mode: str = "single"  # sidebar mode the layer belongs to: single | series
 
 
 class LayerPatch(BaseModel):
     opacity: float | None = None
     visible: bool | None = None
     name: str | None = None
+
+
+class SeriesCreate(BaseModel):
+    start: str
+    end: str
+    cadence_sec: int = 3600
+    members: list[dict[str, str]] = []
 
 
 @app.get("/")
@@ -138,6 +164,49 @@ def health():
 @app.get("/api/download/progress")
 def download_progress():
     return {"downloads": progress.snapshot()}
+
+
+@app.get("/api/cache/layers")
+def cache_layers():
+    return {"frames": list_cached_frames()}
+
+
+# --- Time series ------------------------------------------------------------
+
+@app.get("/api/series")
+def series_list():
+    return {"series": series_mod.list_series()}
+
+
+@app.get("/api/series/{series_id}")
+def series_detail(series_id: str):
+    entry = series_mod.get_series(series_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Series not found")
+    return entry
+
+
+@app.post("/api/series")
+def series_create(request: SeriesCreate):
+    try:
+        created = series_mod.create_series(request.start, request.end, request.cadence_sec, request.members)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "series": created}
+
+
+@app.post("/api/series/{series_id}/cancel")
+def series_cancel(series_id: str):
+    if not series_mod.cancel_series(series_id):
+        raise HTTPException(status_code=404, detail="Series not found or not downloading")
+    return {"ok": True}
+
+
+@app.delete("/api/series/{series_id}")
+def series_delete(series_id: str):
+    if not series_mod.delete_series(series_id):
+        raise HTTPException(status_code=404, detail="Series not found")
+    return {"ok": True, "series": series_mod.list_series()}
 
 
 @app.websocket("/ws")
@@ -165,8 +234,8 @@ def layers():
 
 
 @app.delete("/api/layers")
-def clear_layers():
-    store.clear()
+def clear_layers(mode: str | None = None):
+    store.clear(mode)
     return {"ok": True, "layers": store.to_list()}
 
 
@@ -201,48 +270,68 @@ def load_helioviewer(request: HelioviewerLoad):
     mapping = {}
     source_id = int(PRESETS[request.preset]["source_id"])
     used_server = request.server
-    for server in server_fallback_order(request.server):
-        try:
+    if request.cache_only:
+        # Reload a previously downloaded frame: match by (server, preset, date)
+        # regardless of source id, and never touch the network. Series reloads
+        # also pass `closest`: several requested times collapse onto one archive
+        # frame whose manifest record keeps only the last requested date.
+        for server in server_fallback_order(request.server):
             client = HelioviewerClient(server)
-            cached = client.get_cached_layer(source_id, request.date, request.preset)
+            cached = client.get_cached_layer(None, request.date, request.preset)
+            if cached is None and request.closest:
+                cached = cached_layer_lookup_by_closest(
+                    server, None, request.preset, normalize_api_date(request.closest)
+                )
             if cached is not None:
                 image_path, mapping = cached
                 used_server = server
                 break
-            server_source_id = client.resolve_preset_source_id(request.preset)
-            closest = client.get_closest_image(server_source_id, normalize_date(request.date))
-            delta = closest_delta_seconds(closest, request.date)
-            if delta is not None and delta > MAX_FRAME_GAP_SECONDS:
-                distant.append((delta, server, server_source_id))
-                attempts.append(
-                    f"{server}: nearest frame {closest.get('date')} is "
-                    f"{delta / 3600:.1f} h from the requested time"
+        if image_path is None:
+            raise HTTPException(status_code=404, detail="Not in local cache")
+        source_id = int(mapping.get("sourceId") or source_id)
+    else:
+        for server in server_fallback_order(request.server):
+            try:
+                client = HelioviewerClient(server)
+                cached = client.get_cached_layer(source_id, request.date, request.preset)
+                if cached is not None:
+                    image_path, mapping = cached
+                    used_server = server
+                    break
+                server_source_id = client.resolve_preset_source_id(request.preset)
+                closest = client.get_closest_image(server_source_id, normalize_date(request.date))
+                delta = closest_delta_seconds(closest, request.date)
+                if delta is not None and delta > MAX_FRAME_GAP_SECONDS:
+                    distant.append((delta, server, server_source_id))
+                    attempts.append(
+                        f"{server}: nearest frame {closest.get('date')} is "
+                        f"{delta / 3600:.1f} h from the requested time"
+                    )
+                    continue
+                source_id = server_source_id
+                image_path, mapping = client.fetch_jp2_layer(
+                    source_id=source_id,
+                    date=request.date,
+                    preset=request.preset,
                 )
-                continue
-            source_id = server_source_id
-            image_path, mapping = client.fetch_jp2_layer(
-                source_id=source_id,
-                date=request.date,
-                preset=request.preset,
-            )
-            used_server = server
-            break
-        except Exception as exc:
-            attempts.append(f"{server}: {exc}")
-    if image_path is None and distant:
-        # Every server only has a far-away frame: fall back to the closest one.
-        _, server, server_source_id = min(distant, key=lambda item: item[0])
-        try:
-            client = HelioviewerClient(server)
-            source_id = server_source_id
-            image_path, mapping = client.fetch_jp2_layer(
-                source_id=source_id,
-                date=request.date,
-                preset=request.preset,
-            )
-            used_server = server
-        except Exception as exc:
-            attempts.append(f"{server}: {exc}")
+                used_server = server
+                break
+            except Exception as exc:
+                attempts.append(f"{server}: {exc}")
+        if image_path is None and distant:
+            # Every server only has a far-away frame: fall back to the closest one.
+            _, server, server_source_id = min(distant, key=lambda item: item[0])
+            try:
+                client = HelioviewerClient(server)
+                source_id = server_source_id
+                image_path, mapping = client.fetch_jp2_layer(
+                    source_id=source_id,
+                    date=request.date,
+                    preset=request.preset,
+                )
+                used_server = server
+            except Exception as exc:
+                attempts.append(f"{server}: {exc}")
     if image_path is None:
         raise HTTPException(status_code=502, detail="Download failed. " + " | ".join(attempts))
     preset = PRESETS[request.preset]
@@ -250,6 +339,7 @@ def load_helioviewer(request: HelioviewerLoad):
         name=f"{preset['name']} @ {normalize_date(request.date)}",
         image_path=image_path,
         opacity=request.opacity,
+        mode=request.mode,
         metadata={
             "server": used_server,
             "requestedServer": request.server,
@@ -265,7 +355,7 @@ def load_helioviewer(request: HelioviewerLoad):
 
 
 @app.post("/api/load/fits")
-async def load_fits(file: UploadFile = File(...), opacity: float = Form(1.0), cmap: str = Form("auto")):
+async def load_fits(file: UploadFile = File(...), opacity: float = Form(1.0), cmap: str = Form("auto"), mode: str = Form("single")):
     suffix = Path(file.filename or "upload.fits").suffix or ".fits"
     destination = UPLOAD_DIR / f"{Path(file.filename or 'upload').stem}_{len(store.layers) + 1}{suffix}"
     with destination.open("wb") as handle:
@@ -274,7 +364,7 @@ async def load_fits(file: UploadFile = File(...), opacity: float = Form(1.0), cm
         image_path, metadata = fits_to_png(destination, cmap_name=cmap)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    layer = store.add_image(file.filename or destination.name, image_path, opacity=opacity, metadata={"fits": str(destination), **metadata})
+    layer = store.add_image(file.filename or destination.name, image_path, opacity=opacity, metadata={"fits": str(destination), **metadata}, mode=mode)
     return {"ok": True, "layer": layer.__dict__, "layers": store.to_list()}
 
 
@@ -287,7 +377,7 @@ def load_fits_path(payload: dict[str, Any]):
         image_path, metadata = fits_to_png(path, cmap_name=str(payload.get("cmap", "auto")))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    layer = store.add_image(path.name, image_path, opacity=float(payload.get("opacity", 1.0)), metadata={"fits": str(path), **metadata})
+    layer = store.add_image(path.name, image_path, opacity=float(payload.get("opacity", 1.0)), metadata={"fits": str(path), **metadata}, mode=str(payload.get("mode", "single")))
     return {"ok": True, "layer": layer.__dict__, "layers": store.to_list()}
 
 
@@ -306,7 +396,7 @@ def enable_pfss(payload: dict[str, Any] | None = None):
             )
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"PFSS load failed. {exc}") from exc
-        layer = store.add_pfss(metadata)
+        layer = store.add_pfss(metadata, mode=str(payload.get("mode", "single")))
         return {"ok": True, "layer": layer.__dict__, "layers": store.to_list()}
     for layer in store.layers:
         if layer.kind == "pfss":

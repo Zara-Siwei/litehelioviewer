@@ -9,6 +9,7 @@ venv/
 
 # Test artifacts (screenshots)
 tests/shots/
+test-out.txt
 
 # Backups and temp files
 *.prev

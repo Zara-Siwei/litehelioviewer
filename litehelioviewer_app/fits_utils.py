@@ -31,7 +31,9 @@ def fits_to_png(path: Path, cmap_name: str = "auto") -> tuple[Path, dict]:
 
     safe_lut = "".join(ch.lower() if ch.isalnum() else "_" for ch in lut_name).strip("_")
     key = hashlib.sha1((str(path.resolve()) + str(path.stat().st_mtime_ns) + lut_name).encode("utf-8")).hexdigest()[:12]
-    output = CACHE_DIR / f"fits_{path.stem}_{safe_lut}_{key}.png"
+    output_dir = CACHE_DIR / "FITS"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"fits_{path.stem}_{safe_lut}_{key}.png"
     image.save(output)
     metadata = {
         "shape": list(data.shape),

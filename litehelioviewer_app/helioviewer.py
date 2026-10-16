@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -65,6 +66,19 @@ PRESETS = {
         "source_id": 5,
     },
 }
+
+# Finest archive cadence per instrument, in seconds. Time-series cadence
+# resolves "native" against these and clamps over-fine requests up to them.
+_NATIVE_CADENCE_SEC = {
+    ("SDO", "AIA"): 12,
+    ("SDO", "HMI"): 45,
+    ("SOHO", "LASCO"): 720,
+}
+
+
+def native_cadence_sec(preset: str) -> int | None:
+    info = PRESETS.get(preset) or {}
+    return _NATIVE_CADENCE_SEC.get((str(info.get("observatory")), str(info.get("instrument"))))
 
 
 @dataclass
@@ -161,13 +175,19 @@ class HelioviewerClient:
         if cached is not None:
             return cached
         closest = self.get_closest_image(source_id, normalized_date)
-        header = self.get_jp2_header(closest.get("id"))
         closest_date = normalize_api_date(str(closest.get("date") or normalized_date))
+        # Series downloads revisit the same archive frame under many requested
+        # dates; reuse a stored header instead of re-fetching it every step.
+        header = cached_header_lookup(self.server, source_id, preset, closest_date)
+        if header is None:
+            header = self.get_jp2_header(closest.get("id"))
         stamp = safe_stamp(closest_date)
         base_name = f"hv_{self.server.lower()}_sid{source_id}_{preset or 'source'}_{stamp}"
-        jp2_path = CACHE_DIR / f"{base_name}.jp2"
+        target_dir = CACHE_DIR / cache_subdir(preset, source_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        jp2_path = target_dir / f"{base_name}.jp2"
         lut_name = preset_lut_name(preset)
-        png_path = CACHE_DIR / f"{base_name}_{safe_token(lut_name)}.png"
+        png_path = target_dir / f"{base_name}_{safe_token(lut_name)}.png"
         jp2_cached = jp2_path.exists() and jp2_path.stat().st_size > 0
         png_cached = png_path.exists() and png_path.stat().st_size > 0
         if not jp2_cached:
@@ -204,7 +224,7 @@ class HelioviewerClient:
             "png_cache_hit": png_cached,
         }
 
-    def get_cached_layer(self, source_id: int, date: str, preset: str = "") -> tuple[Path, dict[str, Any]] | None:
+    def get_cached_layer(self, source_id: int | None, date: str, preset: str = "") -> tuple[Path, dict[str, Any]] | None:
         return cached_layer_lookup(self.server, source_id, preset, normalize_date(date))
 
     def get_closest_image(self, source_id: int, date: str) -> dict[str, Any]:
@@ -263,6 +283,110 @@ class HelioviewerClient:
             array = np.asarray(image.convert("L"))
         rgba = apply_lut(array, lut_name)
         Image.fromarray(rgba, mode="RGBA").save(png_path)
+
+def cache_category(preset: str, source_id: Any = None) -> tuple[str, str]:
+    """(group, subgroup) display labels for a cached frame."""
+    info = PRESETS.get(preset)
+    if info:
+        return f"{info['observatory']} / {info['instrument']}", str(info["measurement"])
+    return "Other", f"source {source_id}" if source_id not in (None, "") else "source"
+
+
+def cache_subdir(preset: str, source_id: Any = None) -> Path:
+    """Relative cache directory for a frame: SDO-HMI/Magnetogram, SOHO-LASCO/C2, ..."""
+    info = PRESETS.get(preset)
+    if info:
+        top = f"{info['observatory']}-{info['instrument']}".upper()
+        return Path(top) / safe_dir_token(str(info["measurement"]))
+    if source_id not in (None, ""):
+        return Path("Other") / f"source-{source_id}"
+    return Path("Other")
+
+
+def safe_dir_token(value: str) -> str:
+    token = "".join(ch if ch.isalnum() else "_" for ch in value).strip("_")
+    return token or "misc"
+
+
+def migrate_cache_layout() -> None:
+    """Move flat-layout cache files into category subdirs and rewrite the manifest.
+
+    Idempotent; runs at backend startup. Cache content is re-downloadable, so
+    duplicates collapse silently and unparseable strays are left alone.
+    """
+    manifest = CACHE_DIR / "manifest.json"
+    data: dict[str, Any] = {}
+    if manifest.exists():
+        try:
+            raw = json.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data = raw
+        except Exception:
+            data = {}
+    changed = False
+    new_data: dict[str, Any] = {}
+    for key, record in data.items():
+        if not isinstance(record, dict):
+            new_data[key] = record
+            continue
+        preset = str(record.get("preset") or "")
+        for field in ("png", "jp2"):
+            rel = _cache_relative(record.get(field))
+            if rel is None or len(rel.parts) > 1:
+                continue  # outside the cache dir or already categorized
+            target = CACHE_DIR / cache_subdir(preset, record.get("sourceId")) / rel.name
+            source = CACHE_DIR / rel
+            if source.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    source.unlink()  # duplicate of an already-migrated copy
+                else:
+                    source.replace(target)
+                changed = True
+            if target.exists():
+                record[field] = str(target)
+                changed = True
+        new_data[_manifest_key(record.get("png"), key)] = record
+    if set(new_data) != set(data):
+        changed = True
+    if changed:
+        manifest.write_text(json.dumps(new_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # sweep loose frame files that no manifest record references
+    stray = re.compile(r"^hv_[a-z]+_sid(\d+)_(.+)_\d{8}_\d{6}(?:_.*)?\.(?:jp2|png)$")
+    for item in CACHE_DIR.iterdir():
+        if not item.is_file():
+            continue
+        match = stray.match(item.name)
+        if match:
+            sid, preset = match.group(1), match.group(2)
+            target = CACHE_DIR / cache_subdir("" if preset == "source" else preset, sid) / item.name
+        elif item.name.startswith("fits_") and item.suffix == ".png":
+            target = CACHE_DIR / "FITS" / item.name
+        else:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            item.unlink()
+        else:
+            item.replace(target)
+
+
+def _cache_relative(value: Any) -> Path | None:
+    if not value:
+        return None
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = CACHE_DIR / path
+    try:
+        return path.relative_to(CACHE_DIR)
+    except ValueError:
+        return None
+
+
+def _manifest_key(png_value: Any, fallback: str) -> str:
+    rel = _cache_relative(png_value)
+    return rel.as_posix() if rel is not None else fallback
+
 
 def closest_mapping(closest: dict[str, Any], header: dict[str, Any] | None = None, preset: str = "") -> dict[str, Any]:
     header = header or {}
@@ -361,7 +485,7 @@ def parse_jp2_header(text: str) -> dict[str, Any]:
     return values
 
 
-def cached_layer_lookup(server: str, source_id: int, preset: str, normalized_date: str) -> tuple[Path, dict[str, Any]] | None:
+def cached_layer_lookup(server: str, source_id: int | None, preset: str, normalized_date: str) -> tuple[Path, dict[str, Any]] | None:
     manifest = CACHE_DIR / "manifest.json"
     if not manifest.exists():
         return None
@@ -372,15 +496,142 @@ def cached_layer_lookup(server: str, source_id: int, preset: str, normalized_dat
     if not isinstance(data, dict):
         return None
     for record in data.values():
+        if not _record_matches(record, server, source_id, preset):
+            continue
+        if normalize_date(str(record.get("requestedDate") or "")) != normalized_date:
+            continue
+        return _layer_from_record(record, normalized_date)
+    return None
+
+
+def cached_layer_lookup_by_closest(server: str, source_id: int | None, preset: str, closest_date: str) -> tuple[Path, dict[str, Any]] | None:
+    """Cache hit by archive frame time (closestDate) instead of requested date.
+
+    Needed for series reloads: several requested times collapse onto one
+    archive frame, and the manifest (keyed by png path) keeps only the last
+    requested date for that frame.
+    """
+    manifest = CACHE_DIR / "manifest.json"
+    if not manifest.exists():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    target = normalize_api_date(closest_date)
+    for record in data.values():
+        if not _record_matches(record, server, source_id, preset):
+            continue
+        if normalize_api_date(str(record.get("closestDate") or "")) != target:
+            continue
+        return _layer_from_record(record, target)
+    return None
+
+
+def _record_matches(record: Any, server: str, source_id: int | None, preset: str) -> bool:
+    if not isinstance(record, dict):
+        return False
+    if str(record.get("server")) != server:
+        return False
+    if source_id is not None and int(record.get("sourceId") or -1) != int(source_id):
+        return False
+    return str(record.get("preset") or "") == str(preset or "")
+
+
+def _layer_from_record(record: dict[str, Any], requested_norm: str) -> tuple[Path, dict[str, Any]] | None:
+    png_path = Path(str(record.get("png") or ""))
+    jp2_path = Path(str(record.get("jp2") or ""))
+    if not png_path.is_absolute():
+        png_path = CACHE_DIR / png_path
+    if not jp2_path.is_absolute():
+        jp2_path = CACHE_DIR / jp2_path
+    if not png_path.exists() or png_path.stat().st_size <= 0:
+        return None
+    if not jp2_path.exists() or jp2_path.stat().st_size <= 0:
+        return None
+    preset = str(record.get("preset") or "")
+    closest = record.get("closest") if isinstance(record.get("closest"), dict) else {}
+    header = record.get("jp2_header") if isinstance(record.get("jp2_header"), dict) else {}
+    if closest and not header:
+        return None
+    if closest:
+        mapping = closest_mapping(closest, header, preset)
+    else:
+        mapping = {
+            "texture_center": record.get("texture_center"),
+            "texture_radius": record.get("texture_radius"),
+            "texture_size": record.get("texture_size"),
+            "image_scale": record.get("image_scale"),
+            "rotation": 0.0 if preset.startswith("lasco-") else record.get("rotation", 0.0),
+        }
+    return png_path, {
+        **{key: value for key, value in mapping.items() if value is not None},
+        "sourceId": record.get("sourceId"),
+        "requested_date": requested_norm,
+        "closest_date": normalize_api_date(str(record.get("closestDate") or requested_norm)),
+        "cache_jp2": str(jp2_path),
+        "cache_png": str(png_path),
+        "lut": record.get("lut") or preset_lut_name(preset),
+        "download_method": "local manifest",
+        "cache_hit": True,
+        "jp2_cache_hit": True,
+        "png_cache_hit": True,
+    }
+
+
+def cached_header_lookup(server: str, source_id: int, preset: str, closest_date: str) -> dict[str, Any] | None:
+    """JP2 header already stored for this exact archive frame, if any."""
+    manifest = CACHE_DIR / "manifest.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    for record in data.values():
         if not isinstance(record, dict):
             continue
         if str(record.get("server")) != server:
             continue
-        if int(record.get("sourceId") or -1) != int(source_id):
+        try:
+            if int(record.get("sourceId") or -1) != int(source_id):
+                continue
+        except (TypeError, ValueError):
             continue
         if str(record.get("preset") or "") != str(preset or ""):
             continue
-        if normalize_date(str(record.get("requestedDate") or "")) != normalized_date:
+        if normalize_api_date(str(record.get("closestDate") or "")) != closest_date:
+            continue
+        header = record.get("jp2_header")
+        if isinstance(header, dict) and header:
+            return header
+    return None
+
+
+def manifest_update(path: Path, record: dict[str, Any]) -> None:
+    manifest = CACHE_DIR / "manifest.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+    except Exception:
+        data = {}
+    data[_manifest_key(str(path), path.name)] = record
+    manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def list_cached_frames() -> list[dict[str, Any]]:
+    """Frames available in the local download cache, newest first."""
+    manifest = CACHE_DIR / "manifest.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    frames: list[dict[str, Any]] = []
+    for record in data.values():
+        if not isinstance(record, dict):
             continue
         png_path = Path(str(record.get("png") or ""))
         jp2_path = Path(str(record.get("jp2") or ""))
@@ -392,43 +643,21 @@ def cached_layer_lookup(server: str, source_id: int, preset: str, normalized_dat
             continue
         if not jp2_path.exists() or jp2_path.stat().st_size <= 0:
             continue
-        closest = record.get("closest") if isinstance(record.get("closest"), dict) else {}
-        header = record.get("jp2_header") if isinstance(record.get("jp2_header"), dict) else {}
-        if closest and not header:
-            return None
-        if closest:
-            mapping = closest_mapping(closest, header, str(record.get("preset") or preset))
-        else:
-            mapping = {
-                "texture_center": record.get("texture_center"),
-                "texture_radius": record.get("texture_radius"),
-                "texture_size": record.get("texture_size"),
-                "image_scale": record.get("image_scale"),
-                "rotation": 0.0 if str(record.get("preset", "")).startswith("lasco-") else record.get("rotation", 0.0),
-            }
-        return png_path, {
-            **{key: value for key, value in mapping.items() if value is not None},
-            "requested_date": normalized_date,
-            "closest_date": normalize_api_date(str(record.get("closestDate") or normalized_date)),
-            "cache_jp2": str(jp2_path),
-            "cache_png": str(png_path),
-            "lut": record.get("lut") or preset_lut_name(preset),
-            "download_method": "local manifest",
-            "cache_hit": True,
-            "jp2_cache_hit": True,
-            "png_cache_hit": True,
-        }
-    return None
-
-
-def manifest_update(path: Path, record: dict[str, Any]) -> None:
-    manifest = CACHE_DIR / "manifest.json"
-    try:
-        data = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
-    except Exception:
-        data = {}
-    data[path.name] = record
-    manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        preset = str(record.get("preset") or "")
+        category, subcategory = cache_category(preset, record.get("sourceId"))
+        frames.append({
+            "preset": preset,
+            "name": str(PRESETS.get(preset, {}).get("name") or preset or f"source {record.get('sourceId')}"),
+            "category": category,
+            "subcategory": subcategory,
+            "server": str(record.get("server") or ""),
+            "sourceId": record.get("sourceId"),
+            "requestedDate": str(record.get("requestedDate") or ""),
+            "closestDate": str(record.get("closestDate") or ""),
+            "bytes": jp2_path.stat().st_size,
+        })
+    frames.sort(key=lambda frame: frame.get("closestDate") or frame.get("requestedDate") or "", reverse=True)
+    return frames
 
 
 def server_fallback_order(preferred: str) -> list[str]:

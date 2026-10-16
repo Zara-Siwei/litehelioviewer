@@ -5,7 +5,6 @@ const layersEl = document.getElementById("layers");
 const presetEl = document.getElementById("preset");
 const serverEl = document.getElementById("server");
 const dateEl = document.getElementById("date");
-const opacityEl = document.getElementById("opacity");
 const viewReadout = document.getElementById("viewReadout");
 const dropZone = document.getElementById("dropZone");
 const logPanel = document.getElementById("logPanel");
@@ -22,6 +21,7 @@ const expandPanelButton = document.getElementById("expandPanel");
 const cropModeButton = document.getElementById("cropMode");
 const cropDock = document.getElementById("cropDock");
 const cropResize = document.getElementById("cropResize");
+const cropSideResize = document.getElementById("cropSideResize");
 const cropTabs = document.getElementById("cropTabs");
 const cropCanvas = document.getElementById("cropCanvas");
 const cropCtx = cropCanvas.getContext("2d", { willReadFrequently: true });
@@ -49,6 +49,37 @@ const lineList = document.getElementById("lineList");
 const cropExport = document.getElementById("cropExport");
 const cropExportBtn = document.getElementById("cropExportBtn");
 const cropExportMenu = document.getElementById("cropExportMenu");
+const cropExportSeqBtn = document.getElementById("cropExportSeq");
+const cachePickerEl = document.getElementById("cachePicker");
+const cachePickerToggle = document.getElementById("cachePickerToggle");
+const cachePickerMenu = document.getElementById("cachePickerMenu");
+const toggleGridEl = document.getElementById("toggleGrid");
+const toggleCropCrossEl = document.getElementById("toggleCropCross");
+const loadCachedButton = document.getElementById("loadCached");
+const modeSingleButton = document.getElementById("modeSingle");
+const modeSeriesButton = document.getElementById("modeSeries");
+const singleSection = document.getElementById("singleSection");
+const seriesBuilderEl = document.getElementById("seriesBuilder");
+const seriesLibraryEl = document.getElementById("seriesLibrary");
+const seriesStartEl = document.getElementById("seriesStart");
+const seriesEndEl = document.getElementById("seriesEnd");
+const seriesCadenceNumEl = document.getElementById("seriesCadenceNum");
+const seriesCadenceUnitEl = document.getElementById("seriesCadenceUnit");
+const seriesServerEl = document.getElementById("seriesServer");
+const seriesPresetEl = document.getElementById("seriesPreset");
+const seriesAddMemberButton = document.getElementById("seriesAddMember");
+const seriesMembersEl = document.getElementById("seriesMembers");
+const seriesCreateButton = document.getElementById("seriesCreate");
+const seriesListEl = document.getElementById("seriesList");
+const seriesBar = document.getElementById("seriesBar");
+const seriesBarName = document.getElementById("seriesBarName");
+const seriesScrubEl = document.getElementById("seriesScrub");
+const seriesBarTime = document.getElementById("seriesBarTime");
+const seriesBarCount = document.getElementById("seriesBarCount");
+const seriesPlayBtn = document.getElementById("seriesPlay");
+const seriesStepPrevBtn = document.getElementById("seriesStepPrev");
+const seriesStepNextBtn = document.getElementById("seriesStepNext");
+const seriesFpsEl = document.getElementById("seriesFps");
 
 // Keep a WebSocket to the backend while this tab is alive: the socket
 // existing is the presence signal, and closing the tab drops it instantly,
@@ -78,6 +109,7 @@ let cropDrag = null;
 let cropRegions = [];
 let activeCropId = null;
 let cropResizeDrag = null;
+let cropSideResizeDrag = null;
 let cropEndpointDrag = null;
 let cropDockHidden = false;
 let cropPanDrag = null;
@@ -85,6 +117,37 @@ let panelSplitterDrag = null;
 let sideTab = "info";
 let lineDraw = null;
 let plotRegenTimer = null;
+let cachedFrames = [];
+let cachePickerSelection = -1;
+let cacheGroupsCollapsed = loadCacheGroupState();
+let panelMode = "single";
+
+// Single-frame and time-series modes keep independent layer stacks: every
+// layer is tagged with the mode it was created in (server-side `mode` field),
+// and the sidebar list + main canvas only show the current mode's layers.
+function layerMode(layer) {
+  return layer && layer.mode === "series" ? "series" : "single";
+}
+
+function modeLayers() {
+  return layers.filter((layer) => layerMode(layer) === panelMode);
+}
+
+let presetsData = null;
+let stagedMembers = [];
+let seriesList = [];
+let seriesPollTimer = null;
+let seriesStatusSeen = new Map();
+// layerId -> { seriesId, frames, index }: client-side frame stacks for loaded
+// series members. Scrubbing swaps image_url/metadata locally (no round-trip).
+let seriesLayers = new Map();
+let activeSeriesId = null;
+let seriesPlayTimer = null;
+let seriesPlayFps = 5;
+const SERIES_PLAY_LOOKAHEAD = 3;
+let cropSeriesToken = 0;
+let showGrid = localStorage.getItem("lhv.grid") !== "0";
+let showCropCross = localStorage.getItem("lhv.cropCross") !== "0";
 
 const LINE_COLORS = ["#4aa3ff", "#7effac", "#ffb14a", "#ff7ad9", "#8f7aff", "#4affe3"];
 const LINE_COLOR_CHOICES = [...LINE_COLORS, "#ff5c5c", "#ffe74a", "#eef6fc", "#9fb2c2"];
@@ -107,12 +170,17 @@ init();
 
 async function init() {
   setDefaultDate();
+  setDefaultSeriesTimes();
   await loadPresets();
+  renderStagedMembers();
   await refreshLayers();
   await checkHealth();
   setInterval(checkHealth, 5000);
   bindEvents();
   resize();
+  refreshCachedFrames();
+  setPanelMode(localStorage.getItem("lhv.mode") === "series" ? "series" : "single");
+  refreshSeriesList();
 }
 
 function bindEvents() {
@@ -145,11 +213,48 @@ function bindEvents() {
     if (!panelSplitterDrag) return;
     panelSplitterDrag = null;
     panelSplitter.classList.remove("dragging");
+    resize(); // settle the bitmap at the final size, then idle-quality restore
     leaveInteractiveRenderSoon();
   };
   panelSplitter.addEventListener("pointerup", endPanelSplitterDrag);
   panelSplitter.addEventListener("pointercancel", endPanelSplitterDrag);
+  dropZone.addEventListener("pointermove", handleViewerPointerMove);
   document.getElementById("addLayer").addEventListener("click", addHelioviewerLayer);
+  loadCachedButton.addEventListener("click", loadCachedFrame);
+  modeSingleButton.addEventListener("click", () => setPanelMode("single"));
+  modeSeriesButton.addEventListener("click", () => setPanelMode("series"));
+  seriesAddMemberButton.addEventListener("click", stageSeriesMember);
+  seriesCadenceUnitEl.addEventListener("change", () => {
+    seriesCadenceNumEl.disabled = seriesCadenceUnitEl.value === "native";
+  });
+  seriesMembersEl.addEventListener("click", handleStageRemove);
+  seriesCreateButton.addEventListener("click", createSeries);
+  seriesListEl.addEventListener("click", handleSeriesAction);
+  seriesScrubEl.addEventListener("input", () => {
+    pauseSeriesPlay(); // manual scrub takes control
+    scrubSeriesTo(Number(seriesScrubEl.value));
+  });
+  seriesPlayBtn.addEventListener("click", toggleSeriesPlay);
+  seriesStepPrevBtn.addEventListener("click", () => {
+    pauseSeriesPlay();
+    stepSeriesFrame(-1);
+  });
+  seriesStepNextBtn.addEventListener("click", () => {
+    pauseSeriesPlay();
+    stepSeriesFrame(1);
+  });
+  seriesFpsEl.addEventListener("change", () => {
+    seriesPlayFps = Number(seriesFpsEl.value) || 5;
+    if (seriesPlayTimer !== null) startSeriesPlay(); // restart on the new interval
+  });
+  cachePickerToggle.addEventListener("click", () => setCachePickerOpen(cachePickerMenu.hidden));
+  cachePickerMenu.addEventListener("click", handleCachePickerClick);
+  document.addEventListener("mousedown", (event) => {
+    if (!cachePickerMenu.hidden && !cachePickerEl.contains(event.target)) setCachePickerOpen(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !cachePickerMenu.hidden) setCachePickerOpen(false);
+  });
   document.getElementById("clearLayers").addEventListener("click", clearLayers);
   document.getElementById("clearLog").addEventListener("click", () => { logPanel.innerHTML = ""; });
   document.getElementById("togglePfss").addEventListener("click", togglePfss);
@@ -160,10 +265,24 @@ function bindEvents() {
   toggleCropRegionButton.addEventListener("click", toggleCropRegionVisibility);
   resetCropViewButton.addEventListener("click", resetCropView);
   cropExportBtn.addEventListener("click", () => toggleExportMenu());
+  toggleGridEl.checked = showGrid;
+  toggleGridEl.addEventListener("change", () => {
+    showGrid = toggleGridEl.checked;
+    localStorage.setItem("lhv.grid", showGrid ? "1" : "0");
+    scheduleRender();
+  });
+  toggleCropCrossEl.classList.toggle("active", showCropCross);
+  toggleCropCrossEl.addEventListener("click", () => {
+    showCropCross = !showCropCross;
+    toggleCropCrossEl.classList.toggle("active", showCropCross);
+    localStorage.setItem("lhv.cropCross", showCropCross ? "1" : "0");
+    renderCropCanvas();
+  });
   cropExportMenu.querySelectorAll("[data-fmt]").forEach((button) => {
     button.addEventListener("click", () => {
       toggleExportMenu(false);
-      exportCropImage(button.dataset.fmt);
+      if (button.dataset.fmt === "seq") exportCropSequence();
+      else exportCropImage(button.dataset.fmt);
     });
   });
   document.addEventListener("pointerdown", (event) => {
@@ -209,6 +328,7 @@ function bindEvents() {
         const grabbed = hitCropEndpoint(mouseCanvas);
         if (grabbed) {
           enterInteractiveRender();
+          pauseSeriesPlay();
           cropEndpointDrag = grabbed;
           canvas.setPointerCapture(event.pointerId);
         }
@@ -216,6 +336,7 @@ function bindEvents() {
         return;
       }
       enterInteractiveRender();
+      pauseSeriesPlay();
       cropDrag = { start: point, current: point };
       canvas.setPointerCapture(event.pointerId);
       scheduleRender();
@@ -399,6 +520,32 @@ function bindEvents() {
     cropResizeDrag = null;
     leaveInteractiveRenderSoon();
   });
+  cropSideResize.addEventListener("pointerdown", (event) => {
+    const side = cropDock.querySelector(".crop-side");
+    cropSideResizeDrag = { startX: event.clientX, startWidth: side ? side.getBoundingClientRect().width : 280 };
+    cropSideResize.setPointerCapture(event.pointerId);
+    cropSideResize.classList.add("dragging");
+    enterInteractiveRender();
+  });
+  cropSideResize.addEventListener("pointermove", (event) => {
+    if (!cropSideResizeDrag) return;
+    const dockWidth = cropDock.getBoundingClientRect().width;
+    const maxWidth = Math.max(240, dockWidth - 340); // keep the crop view usable
+    const next = clamp(cropSideResizeDrag.startWidth - (event.clientX - cropSideResizeDrag.startX), 200, maxWidth);
+    cropDock.style.setProperty("--crop-side-width", `${Math.round(next)}px`);
+    // No canvas re-render here: the CEA resample is expensive, so the bitmap
+    // is CSS-stretched during the drag and re-rendered once on release.
+  });
+  const endCropSideResize = () => {
+    if (!cropSideResizeDrag) return;
+    cropSideResizeDrag = null;
+    cropSideResize.classList.remove("dragging");
+    resizeCropCanvas();
+    renderCropCanvas();
+    leaveInteractiveRenderSoon();
+  };
+  cropSideResize.addEventListener("pointerup", endCropSideResize);
+  cropSideResize.addEventListener("pointercancel", endCropSideResize);
 
   ["dragenter", "dragover"].forEach((type) => dropZone.addEventListener(type, (event) => {
     event.preventDefault();
@@ -424,27 +571,64 @@ function setPanelCollapsed(collapsed) {
 
 async function loadPresets() {
   const data = await api("/api/presets");
+  presetsData = data;
   serverEl.innerHTML = data.servers.map((server) => `<option value="${server}">${server}</option>`).join("");
   presetEl.innerHTML = Object.entries(data.presets)
     .map(([key, preset]) => `<option value="${key}">${preset.name}</option>`)
     .join("");
   presetEl.value = "hmi-magnetogram";
+  seriesServerEl.innerHTML = serverEl.innerHTML;
+  seriesPresetEl.innerHTML = presetEl.innerHTML;
+  seriesPresetEl.value = "aia-171";
 }
 
 async function refreshLayers() {
   const data = await api("/api/layers");
   layers = data.layers || [];
+  applySeriesOverrides();
   renderLayerList();
   await loadLayerImages();
   scheduleRender();
+  updateSeriesBar();
 }
 
 async function loadLayerImages() {
   await Promise.all(layers.filter((layer) => layer.kind === "image" && layer.image_url).map(loadLayerImage));
 }
 
+// Texture cache keyed by image URL (not layer id) so series scrubbing can swap
+// a layer's frame URL and keep previously decoded frames warm; LRU-capped
+// since a long series would otherwise grow memory without bound.
+const TEXTURE_CACHE_CAP = 40;
+
+function textureKey(layer) {
+  return layer.image_url || layer.id;
+}
+
+function textureHas(layer) {
+  return imageCache.has(textureKey(layer));
+}
+
+function textureGet(layer) {
+  const key = textureKey(layer);
+  if (!imageCache.has(key)) return undefined;
+  const value = imageCache.get(key);
+  imageCache.delete(key);
+  imageCache.set(key, value); // touch: most-recently-used stays longest
+  return value;
+}
+
+function textureSet(layer, texture) {
+  const key = textureKey(layer);
+  imageCache.delete(key);
+  imageCache.set(key, texture);
+  while (imageCache.size > TEXTURE_CACHE_CAP) {
+    imageCache.delete(imageCache.keys().next().value);
+  }
+}
+
 function loadLayerImage(layer) {
-  if (imageCache.has(layer.id)) return Promise.resolve();
+  if (textureHas(layer)) return Promise.resolve();
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
@@ -454,11 +638,12 @@ function loadLayerImage(layer) {
       off.height = img.naturalHeight;
       const offCtx = off.getContext("2d", { willReadFrequently: true });
       offCtx.drawImage(img, 0, 0);
-      imageCache.set(layer.id, {
+      textureSet(layer, {
         width: off.width,
         height: off.height,
         data: offCtx.getImageData(0, 0, off.width, off.height).data,
       });
+      scheduleRender(); // scrub paths don't await loads; paint when ready
       resolve();
     };
     img.onerror = () => resolve();
@@ -490,11 +675,14 @@ function layerDateHtml(layer) {
 }
 
 function renderLayerList() {
-  if (!layers.length) {
-    layersEl.innerHTML = `<p>No layers yet</p>`;
+  const shown = modeLayers();
+  if (!shown.length) {
+    layersEl.innerHTML = panelMode === "series"
+      ? `<p>No series layers loaded — load a saved series below</p>`
+      : `<p>No layers yet</p>`;
     return;
   }
-  layersEl.innerHTML = layers.map((layer) => `
+  layersEl.innerHTML = shown.map((layer) => `
     <div class="layer">
       <div class="layer-head">
         <input type="checkbox" ${layer.visible ? "checked" : ""} data-action="visible" data-id="${layer.id}" />
@@ -505,10 +693,55 @@ function renderLayerList() {
       <input type="range" min="0" max="1" step="0.01" value="${layer.opacity}" data-action="opacity" data-id="${layer.id}" />
     </div>
   `).join("");
-  layersEl.querySelectorAll("[data-action]").forEach((el) => {
-    el.addEventListener("input", handleLayerInput);
+  layersEl.querySelectorAll("input[data-action='opacity']").forEach((el) => {
+    el.addEventListener("input", handleOpacityInput);
+    el.addEventListener("change", handleOpacityCommit);
+  });
+  layersEl.querySelectorAll("[data-action='visible'], [data-action='delete']").forEach((el) => {
     el.addEventListener("click", handleLayerInput);
   });
+}
+
+// Opacity sliders: while dragging we must NOT rebuild the layer list (that would
+// destroy the slider element mid-drag, which is why only clicking used to work).
+// Instead: update local state + re-render the canvas immediately, and debounce
+// the server sync. On `change` (drag released / click done) flush the final
+// value and pull canonical state.
+const opacitySyncTimers = new Map();
+
+function handleOpacityInput(event) {
+  const id = event.currentTarget.dataset.id;
+  const value = Number(event.currentTarget.value);
+  const layer = layers.find((item) => String(item.id) === String(id));
+  if (layer) {
+    layer.opacity = value;
+    scheduleRender();
+  }
+  clearTimeout(opacitySyncTimers.get(id));
+  opacitySyncTimers.set(id, setTimeout(() => {
+    opacitySyncTimers.delete(id);
+    syncLayerOpacity(id, value);
+  }, 250));
+}
+
+function handleOpacityCommit(event) {
+  const id = event.currentTarget.dataset.id;
+  const value = Number(event.currentTarget.value);
+  clearTimeout(opacitySyncTimers.get(id));
+  opacitySyncTimers.delete(id);
+  syncLayerOpacity(id, value).then(() => refreshLayers());
+}
+
+async function syncLayerOpacity(id, value) {
+  try {
+    await fetch(`/api/layers/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ opacity: value }),
+    });
+  } catch {
+    // server unreachable: local value stays; next refreshLayers() resyncs
+  }
 }
 
 async function handleLayerInput(event) {
@@ -516,19 +749,18 @@ async function handleLayerInput(event) {
   const id = event.currentTarget.dataset.id;
   if (action === "delete") {
     await fetch(`/api/layers/${id}`, { method: "DELETE" });
-    imageCache.delete(id);
+    seriesLayers.delete(id);
     await refreshLayers();
     return;
   }
-  const body = {};
-  if (action === "opacity") body.opacity = Number(event.currentTarget.value);
-  if (action === "visible") body.visible = event.currentTarget.checked;
-  await fetch(`/api/layers/${id}`, {
-    method: "PATCH",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  await refreshLayers();
+  if (action === "visible") {
+    await fetch(`/api/layers/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ visible: event.currentTarget.checked }),
+    });
+    await refreshLayers();
+  }
 }
 
 async function addHelioviewerLayer() {
@@ -542,27 +774,667 @@ async function addHelioviewerLayer() {
         preset: presetEl.value,
         server: serverEl.value,
         date: toApiDate(dateEl.value),
-        opacity: Number(opacityEl.value),
+        opacity: 1,
+        mode: panelMode,
       },
     });
-    setStatus("Layer loaded");
-    const meta = result.layer?.metadata || {};
-    const cacheText = meta.cache_hit ? "cache" : "download";
-    appendLog(`Loaded ${result.layer?.name || presetEl.value}; closest=${meta.closest_date || meta.date}; server=${meta.server}; lut=${meta.lut || "Gray"}; ${cacheText}`, "ok");
-    const frame = layerFrameInfo(result.layer || {});
-    if (frame.mismatch) {
-      appendLog(`WARNING: archive gap — nearest ${result.layer?.name || presetEl.value} frame is ${frame.actual}, ${(frame.deltaMin / 60).toFixed(1)} h from the requested time; mixed-date layers will not align`, "error");
-    }
-    if (meta.render_mode === "corona") {
-      fitCoronaLayer(meta);
-    }
+    reportLoadedLayer(result, presetEl.value);
     await refreshLayers();
+    refreshCachedFrames();
   } catch (error) {
     setStatus("Download failed");
     appendLog(error.message, "error");
   } finally {
     stopDownloadProgress();
   }
+}
+
+function reportLoadedLayer(result, fallbackName) {
+  setStatus("Layer loaded");
+  const meta = result.layer?.metadata || {};
+  const cacheText = meta.cache_hit ? "cache" : "download";
+  appendLog(`Loaded ${result.layer?.name || fallbackName}; closest=${meta.closest_date || meta.date}; server=${meta.server}; lut=${meta.lut || "Gray"}; ${cacheText}`, "ok");
+  const frame = layerFrameInfo(result.layer || {});
+  if (frame.mismatch) {
+    appendLog(`WARNING: archive gap — nearest ${result.layer?.name || fallbackName} frame is ${frame.actual}, ${(frame.deltaMin / 60).toFixed(1)} h from the requested time; layers are aligned by Carrington rotation, but features evolve between epochs`, "error");
+  }
+  if (meta.render_mode === "corona") {
+    fitCoronaLayer(meta);
+  }
+}
+
+const CACHE_GROUP_ORDER = ["SDO / HMI", "SDO / AIA", "SOHO / LASCO", "Other"];
+
+function loadCacheGroupState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("lhv.cacheGroups") || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveCacheGroupState() {
+  try {
+    localStorage.setItem("lhv.cacheGroups", JSON.stringify(cacheGroupsCollapsed));
+  } catch {
+    // storage unavailable (private mode etc.): collapse state just stays in memory
+  }
+}
+
+function cacheFrameLabel(frame) {
+  const fmt = (value) => String(value || "").replace("T", " ").replace("Z", "").slice(0, 16);
+  const when = fmt(frame.closestDate || frame.requestedDate);
+  return `${frame.subcategory || frame.name} · ${when} · ${frame.server}`;
+}
+
+function groupCachedFrames() {
+  const groups = new Map();
+  cachedFrames.forEach((frame, index) => {
+    const cat = frame.category || "Other";
+    if (!groups.has(cat)) groups.set(cat, []);
+    groups.get(cat).push({ frame, index });
+  });
+  const catNames = [...groups.keys()].sort((a, b) => {
+    const ia = CACHE_GROUP_ORDER.indexOf(a);
+    const ib = CACHE_GROUP_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
+  });
+  return catNames.map((cat) => ({
+    cat,
+    items: groups.get(cat).sort((a, b) =>
+      String(a.frame.subcategory).localeCompare(String(b.frame.subcategory)) ||
+      String(b.frame.closestDate || "").localeCompare(String(a.frame.closestDate || ""))),
+  }));
+}
+
+async function refreshCachedFrames() {
+  try {
+    const data = await api("/api/cache/layers");
+    cachedFrames = Array.isArray(data.frames) ? data.frames : [];
+  } catch {
+    cachedFrames = [];
+  }
+  if (cachePickerSelection < 0 || cachePickerSelection >= cachedFrames.length) {
+    cachePickerSelection = cachedFrames.length ? 0 : -1;
+  }
+  loadCachedButton.disabled = cachePickerSelection < 0;
+  renderCachePicker();
+}
+
+function renderCachePicker() {
+  const selected = cachedFrames[cachePickerSelection];
+  cachePickerToggle.textContent = selected
+    ? `${selected.category || "Other"} — ${cacheFrameLabel(selected)}`
+    : (cachedFrames.length ? "Select a cached frame…" : "No cached frames");
+  cachePickerToggle.disabled = cachedFrames.length === 0;
+  cachePickerMenu.innerHTML = groupCachedFrames().map(({ cat, items }) => {
+    const collapsed = cacheGroupsCollapsed[cat] ? " collapsed" : "";
+    const options = items.map(({ frame, index }) =>
+      `<button type="button" class="cache-item${index === cachePickerSelection ? " selected" : ""}" data-index="${index}" title="${escapeHtml(cacheFrameLabel(frame))}">${escapeHtml(cacheFrameLabel(frame))}</button>`).join("");
+    return `<div class="cache-group${collapsed}" data-cat="${escapeHtml(cat)}">` +
+      `<button type="button" class="cache-group-label"><span class="cache-group-caret">▼</span>${escapeHtml(cat)}<span class="cache-group-count">${items.length}</span></button>` +
+      `<div class="cache-group-items">${options}</div></div>`;
+  }).join("");
+  if (cachedFrames.length === 0) setCachePickerOpen(false);
+}
+
+function setCachePickerOpen(open) {
+  cachePickerMenu.hidden = !open;
+}
+
+function handleCachePickerClick(event) {
+  const label = event.target.closest(".cache-group-label");
+  if (label) {
+    const group = label.closest(".cache-group");
+    const cat = group.dataset.cat || "";
+    const collapsed = !group.classList.contains("collapsed");
+    group.classList.toggle("collapsed", collapsed);
+    cacheGroupsCollapsed[cat] = collapsed;
+    saveCacheGroupState();
+    return;
+  }
+  const item = event.target.closest(".cache-item");
+  if (item) {
+    cachePickerSelection = Number(item.dataset.index);
+    loadCachedButton.disabled = cachePickerSelection < 0;
+    setCachePickerOpen(false);
+    renderCachePicker();
+  }
+}
+
+async function loadCachedFrame() {
+  const frame = cachedFrames[cachePickerSelection];
+  if (!frame) return;
+  setStatus("Loading cached layer...");
+  appendLog(`Load cached: ${frame.name} @ ${frame.requestedDate || frame.closestDate}`);
+  try {
+    const result = await api("/api/load/helioviewer", {
+      method: "POST",
+      body: {
+        preset: frame.preset,
+        server: frame.server,
+        date: frame.requestedDate || frame.closestDate,
+        opacity: 1,
+        cache_only: true,
+        mode: panelMode,
+      },
+    });
+    reportLoadedLayer(result, frame.name);
+    await refreshLayers();
+  } catch (error) {
+    setStatus("Load failed");
+    appendLog(error.message, "error");
+    refreshCachedFrames();
+  }
+}
+
+// --- Time-series mode -------------------------------------------------------
+
+function setDefaultSeriesTimes() {
+  const end = new Date(Date.UTC(2013, 1, 15, 12, 0, 0));
+  const start = new Date(end.getTime() - 6 * 3600 * 1000);
+  seriesStartEl.value = start.toISOString().slice(0, 19);
+  seriesEndEl.value = end.toISOString().slice(0, 19);
+}
+
+function setPanelMode(mode) {
+  panelMode = mode;
+  try {
+    localStorage.setItem("lhv.mode", mode);
+  } catch {
+    // storage unavailable: keep the mode in memory only
+  }
+  modeSingleButton.classList.toggle("active", mode === "single");
+  modeSeriesButton.classList.toggle("active", mode === "series");
+  singleSection.hidden = mode !== "single";
+  seriesBuilderEl.hidden = mode !== "series";
+  seriesLibraryEl.hidden = mode !== "series";
+  // The two modes own independent layer stacks: leaving series mode pauses
+  // playback and hides the scrub bar; the canvas and LAYERS list re-filter.
+  if (mode !== "series") pauseSeriesPlay();
+  renderLayerList();
+  updateSeriesBar();
+  loadLayerImages(); // no-op when textures are warm; refills after a Clear
+  scheduleRender();
+  if (!cropDockHidden) renderCropCanvas();
+  if (mode === "series") refreshSeriesList();
+}
+
+function stageSeriesMember() {
+  const preset = seriesPresetEl.value;
+  const server = seriesServerEl.value;
+  if (stagedMembers.some((member) => member.preset === preset && member.server === server)) {
+    appendLog("Layer already staged for this series", "error");
+    return;
+  }
+  const label = presetsData?.presets?.[preset]?.name || preset;
+  stagedMembers.push({ preset, server, label });
+  renderStagedMembers();
+}
+
+function renderStagedMembers() {
+  if (!stagedMembers.length) {
+    seriesMembersEl.innerHTML = `<p class="series-empty">No layers staged yet — pick Server + Data, then + Layer</p>`;
+    return;
+  }
+  seriesMembersEl.innerHTML = stagedMembers.map((member, index) => `
+    <div class="series-member">
+      <span class="series-member-name" title="${escapeHtml(member.label)}">${escapeHtml(member.label)}</span>
+      <span class="series-member-server">${escapeHtml(member.server)}</span>
+      <button type="button" data-idx="${index}" title="Remove this layer">X</button>
+    </div>`).join("");
+}
+
+function handleStageRemove(event) {
+  const button = event.target.closest("button[data-idx]");
+  if (!button) return;
+  stagedMembers.splice(Number(button.dataset.idx), 1);
+  renderStagedMembers();
+}
+
+async function createSeries() {
+  if (!stagedMembers.length) {
+    appendLog("Stage at least one layer before creating a series", "error");
+    return;
+  }
+  const unit = seriesCadenceUnitEl.value;
+  let cadenceSec = 0; // 0 = native: the finest cadence the selected sources offer
+  let cadenceLabel = "native cadence";
+  if (unit !== "native") {
+    const num = Math.max(1, Math.floor(Number(seriesCadenceNumEl.value) || 1));
+    cadenceSec = num * Number(unit);
+    cadenceLabel = `${num} ${seriesCadenceUnitEl.selectedOptions[0]?.textContent || "sec"}`;
+  }
+  const body = {
+    start: toApiDate(seriesStartEl.value),
+    end: toApiDate(seriesEndEl.value),
+    cadence_sec: cadenceSec,
+    members: stagedMembers.map(({ preset, server }) => ({ preset, server })),
+  };
+  if (Date.parse(body.end) <= Date.parse(body.start)) {
+    appendLog("Series end must be after start", "error");
+    return;
+  }
+  setStatus("Starting series download...");
+  try {
+    const result = await api("/api/series", { method: "POST", body });
+    activeSeriesId = result.series?.id || activeSeriesId;
+    appendLog(`Series download started: ${body.start} → ${body.end}, every ${cadenceLabel}, ${body.members.length} layer(s)`);
+    const note = result.series?.cadence_note;
+    if (note) appendLog(note, "ok");
+    startDownloadProgress();
+    await refreshSeriesList();
+  } catch (error) {
+    setStatus("Series download failed");
+    appendLog(error.message, "error");
+  }
+}
+
+async function refreshSeriesList() {
+  let items = [];
+  try {
+    items = (await api("/api/series")).series || [];
+  } catch {
+    items = [];
+  }
+  items.forEach((item) => {
+    if (item.status === "ready" && seriesStatusSeen.get(item.id) === "downloading") {
+      appendLog(`Series ready: ${item.name}`, "ok");
+      refreshCachedFrames();
+    }
+    seriesStatusSeen.set(item.id, item.status);
+  });
+  seriesList = items;
+  renderSeriesList();
+  updateSeriesBar();
+  const running = seriesList.some((item) => item.status === "downloading");
+  if (running && !seriesPollTimer) {
+    seriesPollTimer = setInterval(refreshSeriesList, 1000);
+  } else if (!running && seriesPollTimer) {
+    clearInterval(seriesPollTimer);
+    seriesPollTimer = null;
+    stopDownloadProgress();
+  }
+}
+
+function renderSeriesList() {
+  if (!seriesList.length) {
+    seriesListEl.innerHTML = `<p class="series-empty">No series yet — set a range, stage layers, then Add timeseries</p>`;
+    return;
+  }
+  seriesListEl.innerHTML = seriesList.map((item) => {
+    const done = Number(item.progress?.done) || 0;
+    const total = Number(item.progress?.total) || 0;
+    const pct = total ? Math.round((done / total) * 100) : (item.status === "ready" ? 100 : 0);
+    const members = (item.members || []).map((m) => `${escapeHtml(m.label)} (${m.frames})`).join(" + ");
+    const cs = Number(item.cadence_sec) || 0;
+    const cadence = cs >= 86400 ? `${cs / 86400} day` : cs >= 3600 ? `${cs / 3600} h` : cs >= 60 ? `${cs / 60} min` : `${cs} s`;
+    const meta = `${cadence} cadence · ${done}/${total} steps`;
+    const errors = (item.errors && item.errors.length)
+      ? `<div class="series-card-errors">${item.errors.length} frame(s) skipped: ${escapeHtml(item.errors[item.errors.length - 1])}</div>`
+      : "";
+    const actions = [];
+    if (item.status === "ready") actions.push(`<button type="button" data-action="load" data-id="${item.id}">Load</button>`);
+    if (item.status === "downloading") actions.push(`<button type="button" data-action="cancel" data-id="${item.id}">Cancel</button>`);
+    actions.push(`<button type="button" data-action="delete" data-id="${item.id}" title="Remove from the list; downloaded frames stay in the cache">Delete</button>`);
+    return `<div class="series-card" data-id="${item.id}">
+      <div class="series-card-head"><span class="series-card-name">${escapeHtml(item.name)}</span><span class="series-status ${escapeHtml(item.status)}">${escapeHtml(item.status)}</span></div>
+      <div class="series-card-members" title="${members}">${members}</div>
+      ${item.status === "downloading" ? `<div class="series-progress"><span style="width:${pct}%"></span></div>` : ""}
+      <div class="series-card-meta">${meta}</div>
+      ${errors}
+      <div class="series-card-actions">${actions.join("")}</div>
+    </div>`;
+  }).join("");
+}
+
+function handleSeriesAction(event) {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const id = button.dataset.id;
+  if (button.dataset.action === "load") loadSeries(id);
+  else if (button.dataset.action === "cancel") cancelSeries(id);
+  else if (button.dataset.action === "delete") deleteSeries(id);
+}
+
+async function loadSeries(seriesId) {
+  pauseSeriesPlay();
+  setStatus("Loading series...");
+  try {
+    const detail = await api(`/api/series/${seriesId}`);
+    const members = (detail.members || []).filter((member) => (member.frames || []).length > 0);
+    if (!members.length) throw new Error("Series has no downloaded frames");
+    for (const member of members) {
+      const frame = member.frames[0];
+      const result = await api("/api/load/helioviewer", {
+        method: "POST",
+        body: {
+          preset: member.preset,
+          server: member.server,
+          date: frame.requested,
+          closest: frame.closest,
+          opacity: 1,
+          cache_only: true,
+          mode: "series",
+        },
+      });
+      const layerId = result.layer?.id;
+      if (layerId) {
+        seriesLayers.set(layerId, { seriesId, frames: member.frames, index: 0 });
+      }
+    }
+    activeSeriesId = seriesId;
+    appendLog(`Series loaded: ${detail.name} (${members.length} layer(s), ${members[0].frames.length} steps)`);
+    await refreshLayers();
+    refreshSeriesCrops(); // re-anchor any existing crops to frame 0
+    setStatus("Series loaded");
+  } catch (error) {
+    setStatus("Series load failed");
+    appendLog(error.message, "error");
+  }
+}
+
+async function cancelSeries(seriesId) {
+  try {
+    await api(`/api/series/${seriesId}/cancel`, { method: "POST" });
+    appendLog("Series download cancelled");
+  } catch (error) {
+    appendLog(error.message, "error");
+  }
+  await refreshSeriesList();
+}
+
+async function deleteSeries(seriesId) {
+  try {
+    await api(`/api/series/${seriesId}`, { method: "DELETE" });
+    appendLog("Series removed (frames kept in cache)");
+    // Loaded member layers stay on screen but detach from the scrubber.
+    for (const [layerId, entry] of [...seriesLayers.entries()]) {
+      if (entry.seriesId === seriesId) seriesLayers.delete(layerId);
+    }
+    if (activeSeriesId === seriesId) activeSeriesId = null;
+    renderLayerList();
+    updateSeriesBar();
+  } catch (error) {
+    appendLog(error.message, "error");
+  }
+  await refreshSeriesList();
+}
+
+function seriesEntriesFor(seriesId) {
+  return [...seriesLayers.entries()].filter(([, entry]) => entry.seriesId === seriesId);
+}
+
+// Swap each loaded series member's texture + metadata to its current frame.
+// Called after refreshLayers() (server state is the pre-scrub frame) and on
+// every scrub step.
+function applySeriesOverrides() {
+  for (const layer of layers) {
+    const entry = seriesLayers.get(layer.id);
+    if (!entry) continue;
+    const frame = entry.frames[entry.index];
+    if (!frame) continue;
+    const mapping = frame.mapping || {};
+    const nextUrl = `/data/cache/${frame.png}`;
+    // Never blank the layer: if the target frame's texture is not decoded yet
+    // (first playback after startup warms the cache on the fly), keep the
+    // previous frame on screen and swap URL + metadata once it arrives.
+    if (layer.image_url && layer.image_url !== nextUrl && !imageCache.has(nextUrl)) {
+      warmTexture(nextUrl, layer.created_at).then(() => {
+        const current = seriesLayers.get(layer.id);
+        if (!current || current.frames[current.index] !== frame) return;
+        layer.image_url = nextUrl;
+        layer.metadata = {
+          ...layer.metadata,
+          ...mapping,
+          requestedDate: frame.requested,
+          date: mapping.closest_date || frame.closest,
+          series: { id: entry.seriesId },
+        };
+        scheduleRender();
+      });
+      continue;
+    }
+    layer.image_url = nextUrl;
+    layer.metadata = {
+      ...layer.metadata,
+      ...mapping,
+      requestedDate: frame.requested,
+      date: mapping.closest_date || frame.closest,
+      series: { id: entry.seriesId },
+    };
+  }
+}
+
+// Scrub by primary-member frame index; every other member snaps to the frame
+// closest in time (members may have different counts after dedupe).
+function scrubSeriesTo(index) {
+  const entries = seriesEntriesFor(activeSeriesId);
+  if (!entries.length) return;
+  const primary = entries[0][1];
+  const clamped = clamp(index, 0, primary.frames.length - 1);
+  const targetMs = Date.parse(primary.frames[clamped].closest) || 0;
+  for (const [, entry] of entries) {
+    let best = 0;
+    let bestDelta = Infinity;
+    entry.frames.forEach((frame, i) => {
+      const delta = Math.abs((Date.parse(frame.closest) || 0) - targetMs);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        best = i;
+      }
+    });
+    entry.index = best;
+  }
+  applySeriesOverrides();
+  renderLayerList();
+  syncSeriesCropFrames();
+  const cropToken = ++cropSeriesToken;
+  const pending = loadLayerImages();
+  pending.then(() => {
+    if (cropToken === cropSeriesToken) refreshSeriesCrops();
+  });
+  scheduleRender();
+  updateSeriesBar();
+  return pending; // resolves when frame textures are decoded (crop refresh ran first)
+}
+
+// --- crop regions follow the series frame -------------------------------------
+// A crop is anchored in Carrington coordinates; only the frame's observation
+// ephemeris (centralLon / centerLatObs) and the endpoints' cached base vectors
+// are time-dependent. Refresh those per series frame — bounds, CEA geometry and
+// drawn lines all stay put because they are Carrington-anchored.
+function syncRegionFrameToContext(region, carr) {
+  region.frame.centralLon = carr.centralLon;
+  region.frame.centerLatObs = carr.centerLat;
+  region.start.base = carringtonToBaseVector(region.start.carringtonLon, region.start.lat, carr.centralLon, carr.centerLat);
+  region.end.base = carringtonToBaseVector(region.end.carringtonLon, region.end.lat, carr.centralLon, carr.centerLat);
+}
+
+function syncSeriesCropFrames() {
+  if (!cropRegions.length) return;
+  const carr = carringtonContext();
+  for (const region of cropRegions) syncRegionFrameToContext(region, carr);
+}
+
+// Resample every crop against the current frame's textures. The pixel pass is
+// skipped while the dock is collapsed (toggleCropDock re-renders on expand) or
+// when no image layer survives (keep the last rendered patch instead of
+// wiping it to background). View zoom/pan survives the re-render; while
+// playing we resample lighter and restore full resolution on pause.
+function refreshSeriesCrops() {
+  syncSeriesCropFrames();
+  if (!cropRegions.length || cropDock.hidden) return;
+  if (!layers.some((layer) => layer.visible && layerMode(layer) === panelMode && layer.kind === "image")) return;
+  const maxBase = isSeriesPlaying() ? 320 : 620;
+  for (const region of cropRegions) {
+    const view = region.view;
+    renderCropImage(region, maxBase);
+    if (view) region.view = view;
+  }
+  renderCropCanvas();
+}
+
+function updateSeriesBar() {
+  for (const id of [...seriesLayers.keys()]) {
+    if (!layers.some((layer) => layer.id === id)) seriesLayers.delete(id);
+  }
+  let entries = seriesEntriesFor(activeSeriesId);
+  if (!entries.length && seriesLayers.size) {
+    activeSeriesId = [...seriesLayers.values()][seriesLayers.size - 1].seriesId;
+    entries = seriesEntriesFor(activeSeriesId);
+  }
+  if (!entries.length || panelMode !== "series") {
+    pauseSeriesPlay();
+    seriesBar.hidden = true;
+    seriesBar.classList.remove("concealed");
+    if (seriesBarConcealTimer) {
+      clearTimeout(seriesBarConcealTimer);
+      seriesBarConcealTimer = null;
+    }
+    return;
+  }
+  const primary = entries[0][1];
+  const frame = primary.frames[primary.index];
+  const series = seriesList.find((item) => item.id === activeSeriesId);
+  seriesBarName.textContent = series ? series.name : "Series";
+  seriesBarName.title = seriesBarName.textContent;
+  seriesScrubEl.max = String(Math.max(0, primary.frames.length - 1));
+  seriesScrubEl.value = String(primary.index);
+  seriesBarTime.textContent = frame ? `${formatSeriesTime(frame.closest)} UTC` : "";
+  seriesBarCount.textContent = `${primary.index + 1} / ${primary.frames.length}`;
+  seriesBar.hidden = false;
+  revealSeriesBar();
+  if (!isSeriesPlaying()) concealSeriesBarSoon(2600);
+}
+
+// --- series bar auto-hide ---------------------------------------------------
+// The bar fades out when the mouse leaves the bottom of the viewer, and stays
+// pinned while playing. Hovering near the bottom edge reveals it again.
+let seriesBarConcealTimer = null;
+
+function revealSeriesBar() {
+  if (seriesBar.hidden) return;
+  seriesBar.classList.remove("concealed");
+  if (seriesBarConcealTimer) {
+    clearTimeout(seriesBarConcealTimer);
+    seriesBarConcealTimer = null;
+  }
+}
+
+function concealSeriesBarSoon(delay = 700) {
+  if (seriesBar.hidden) return;
+  if (seriesBarConcealTimer) clearTimeout(seriesBarConcealTimer);
+  seriesBarConcealTimer = setTimeout(() => {
+    seriesBarConcealTimer = null;
+    if (isSeriesPlaying() || seriesBar.hidden) return;
+    seriesBar.classList.add("concealed");
+  }, delay);
+}
+
+function handleViewerPointerMove(event) {
+  if (seriesBar.hidden || panelMode !== "series") return;
+  const rect = dropZone.getBoundingClientRect();
+  if (rect.bottom - event.clientY < 120) {
+    revealSeriesBar();
+  } else if (!isSeriesPlaying()) {
+    concealSeriesBarSoon(500);
+  }
+}
+
+function formatSeriesTime(value) {
+  return String(value || "").replace("T", " ").replace("Z", "").slice(5, 16);
+}
+
+// --- playback ---------------------------------------------------------------
+
+function isSeriesPlaying() {
+  return seriesPlayTimer !== null;
+}
+
+function toggleSeriesPlay() {
+  if (isSeriesPlaying()) pauseSeriesPlay();
+  else startSeriesPlay();
+}
+
+function startSeriesPlay() {
+  const entries = seriesEntriesFor(activeSeriesId);
+  if (!entries.length) return;
+  const primary = entries[0][1];
+  if (primary.frames.length < 2) return;
+  pauseSeriesPlay();
+  seriesPlayBtn.textContent = "❚❚";
+  seriesPlayBtn.title = "Pause";
+  seriesPlayBtn.classList.add("playing");
+  seriesPlayTimer = setInterval(() => {
+    const current = seriesEntriesFor(activeSeriesId);
+    if (!current.length) {
+      pauseSeriesPlay();
+      return;
+    }
+    const stack = current[0][1];
+    scrubSeriesTo((stack.index + 1) % stack.frames.length); // loop
+    warmSeriesFrames();
+  }, 1000 / seriesPlayFps);
+  warmSeriesFrames();
+  revealSeriesBar(); // pinned visible while playing
+}
+
+function pauseSeriesPlay() {
+  const wasPlaying = seriesPlayTimer !== null;
+  if (wasPlaying) {
+    clearInterval(seriesPlayTimer);
+    seriesPlayTimer = null;
+  }
+  seriesPlayBtn.textContent = "▶";
+  seriesPlayBtn.title = "Play";
+  seriesPlayBtn.classList.remove("playing");
+  if (wasPlaying) refreshSeriesCrops(); // restore full-resolution patch
+  if (wasPlaying) concealSeriesBarSoon(1200);
+}
+
+function stepSeriesFrame(delta) {
+  const entries = seriesEntriesFor(activeSeriesId);
+  if (!entries.length) return;
+  const primary = entries[0][1];
+  scrubSeriesTo(primary.index + delta); // clamped inside scrubSeriesTo
+}
+
+// Pre-decode the next few frames of every loaded member so playback does not
+// stutter on the first pass; the URL-keyed LRU texture cache keeps them warm.
+function warmSeriesFrames() {
+  for (const [layerId, entry] of seriesEntriesFor(activeSeriesId)) {
+    const layer = layers.find((item) => item.id === layerId);
+    const tag = layer ? layer.created_at : "";
+    for (let k = 1; k <= SERIES_PLAY_LOOKAHEAD; k += 1) {
+      const frame = entry.frames[(entry.index + k) % entry.frames.length];
+      if (frame) warmTexture(`/data/cache/${frame.png}`, tag);
+    }
+  }
+}
+
+function warmTexture(url, tag) {
+  if (imageCache.has(url)) return Promise.resolve();
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const off = document.createElement("canvas");
+      off.width = img.naturalWidth;
+      off.height = img.naturalHeight;
+      const offCtx = off.getContext("2d", { willReadFrequently: true });
+      offCtx.drawImage(img, 0, 0);
+      textureSet({ image_url: url, id: url }, {
+        width: off.width,
+        height: off.height,
+        data: offCtx.getImageData(0, 0, off.width, off.height).data,
+      });
+      resolve();
+    };
+    img.onerror = () => resolve();
+    img.src = `${url}?t=${encodeURIComponent(tag || "")}`;
+  });
 }
 
 async function uploadFits(file) {
@@ -572,6 +1444,7 @@ async function uploadFits(file) {
   form.append("file", file);
   form.append("opacity", "1");
   form.append("cmap", "auto");
+  form.append("mode", panelMode);
   const response = await fetch("/api/load/fits", { method: "POST", body: form });
   if (!response.ok) {
     const text = await response.text();
@@ -586,9 +1459,10 @@ async function uploadFits(file) {
 }
 
 async function clearLayers() {
-  await fetch("/api/layers", { method: "DELETE" });
+  // Clear only the current mode's stack — the other mode keeps its layers.
+  await fetch(`/api/layers?mode=${panelMode}`, { method: "DELETE" });
   imageCache.clear();
-  appendLog("Cleared all layers");
+  appendLog(panelMode === "series" ? "Cleared series layers" : "Cleared all layers");
   await refreshLayers();
 }
 
@@ -606,6 +1480,7 @@ async function togglePfss() {
         central_lon: context.centralLon,
         detail: 0,
         radius: 2.5,
+        mode: panelMode,
       },
     });
     const pfss = result.layer?.metadata || {};
@@ -707,6 +1582,7 @@ function toggleCropDock() {
   if (!cropRegions.length) return;
   cropDockHidden = !cropDockHidden;
   updateCropDock();
+  if (!cropDockHidden && seriesLayers.size) refreshSeriesCrops(); // re-render if frames moved on
   appendLog(cropDockHidden ? "CEA crop window collapsed" : "CEA crop window expanded");
 }
 
@@ -733,6 +1609,7 @@ function defaultCropView() {
 
 function toggleExportMenu(force) {
   const open = typeof force === "boolean" ? force : cropExportMenu.hidden;
+  if (open) cropExportSeqBtn.hidden = !(seriesLayers.size && panelMode === "series"); // sequence export needs a loaded series
   cropExportMenu.hidden = !open;
 }
 
@@ -747,12 +1624,7 @@ function exportFileName(region, ext) {
 
 // Clean export: original CEA texture at native resolution plus the committed
 // analysis lines and their sampling bands. No axes, borders or margins.
-function exportCropImage(format) {
-  const region = activeCrop();
-  if (!region || !region.imageCanvas) {
-    appendLog("Nothing to export: no crop image", "error");
-    return;
-  }
+function buildCropExportCanvas(region) {
   const w = region.image.width;
   const h = region.image.height;
   const out = document.createElement("canvas");
@@ -784,6 +1656,27 @@ function exportCropImage(format) {
     octx.setLineDash([]);
     octx.globalAlpha = 1;
   }
+  return out;
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+function exportCropImage(format) {
+  const region = activeCrop();
+  if (!region || !region.imageCanvas) {
+    appendLog("Nothing to export: no crop image", "error");
+    return;
+  }
+  const out = buildCropExportCanvas(region);
   const ext = format === "jpg" ? "jpg" : "png";
   const mime = format === "jpg" ? "image/jpeg" : "image/png";
   const filename = exportFileName(region, ext);
@@ -792,16 +1685,133 @@ function exportCropImage(format) {
       appendLog(`Export of ${region.name} failed`, "error");
       return;
     }
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-    appendLog(`Exported ${region.name} as ${filename} (${w}x${h})`, "ok");
+    downloadBlob(blob, filename);
+    appendLog(`Exported ${region.name} as ${filename} (${out.width}x${out.height})`, "ok");
   }, mime, 0.92);
+}
+
+// --- zero-dependency ZIP writer (store-only: PNGs are already compressed) ----
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i += 1) crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+class ZipWriter {
+  constructor() {
+    this.chunks = [];
+    this.central = [];
+    this.offset = 0;
+  }
+
+  add(name, bytes) {
+    const nameBytes = new TextEncoder().encode(name);
+    const crc = crc32(bytes);
+    const header = new DataView(new ArrayBuffer(30));
+    header.setUint32(0, 0x04034B50, true);
+    header.setUint16(4, 20, true);      // version needed
+    header.setUint16(6, 0x0800, true);  // UTF-8 file names
+    header.setUint16(8, 0, true);       // store (no compression)
+    header.setUint16(12, 0x21, true);   // DOS date 1980-01-01
+    header.setUint32(14, crc, true);
+    header.setUint32(18, bytes.length, true);
+    header.setUint32(22, bytes.length, true);
+    header.setUint16(26, nameBytes.length, true);
+    this.chunks.push(header.buffer, nameBytes, bytes);
+    this.central.push({ nameBytes, crc, size: bytes.length, offset: this.offset });
+    this.offset += 30 + nameBytes.length + bytes.length;
+  }
+
+  build() {
+    const centralStart = this.offset;
+    const dirChunks = [];
+    for (const entry of this.central) {
+      const rec = new DataView(new ArrayBuffer(46));
+      rec.setUint32(0, 0x02014B50, true);
+      rec.setUint16(4, 20, true);
+      rec.setUint16(6, 20, true);
+      rec.setUint16(8, 0x0800, true);
+      rec.setUint16(12, 0, true);
+      rec.setUint16(14, 0x21, true);
+      rec.setUint32(16, entry.crc, true);
+      rec.setUint32(20, entry.size, true);
+      rec.setUint32(24, entry.size, true);
+      rec.setUint16(28, entry.nameBytes.length, true);
+      rec.setUint32(42, entry.offset, true);
+      dirChunks.push(rec.buffer, entry.nameBytes);
+      this.offset += 46 + entry.nameBytes.length;
+    }
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054B50, true);
+    end.setUint16(8, this.central.length, true);
+    end.setUint16(10, this.central.length, true);
+    end.setUint32(12, this.offset - centralStart, true);
+    end.setUint32(16, centralStart, true);
+    return new Blob([...this.chunks, ...dirChunks, end.buffer], { type: "application/zip" });
+  }
+}
+
+function exportFileNameForFrame(region, frame, ext) {
+  const stamp = String(frame.closest || "").replace("T", "_").replace(/:/g, "").replace(/\.\d+(Z)?$/, "$1").replace(/Z$/, "");
+  const base = region.name.replace(/\s+/g, "-");
+  return stamp ? `${base}_${stamp}.${ext}` : `${base}.${ext}`;
+}
+
+// Export the active crop re-rendered at every loaded series frame, as one zip
+// of full-resolution PNGs. Reuses the scrub machinery (WYSIWYG — the timeline
+// visibly walks the frames), then restores the pre-export position.
+let seriesExporting = false;
+
+async function exportCropSequence() {
+  const region = activeCrop();
+  const entries = seriesEntriesFor(activeSeriesId);
+  if (!region || !region.imageCanvas) {
+    appendLog("Nothing to export: no crop image", "error");
+    return;
+  }
+  if (!entries.length) {
+    appendLog("Load a series first to export a frame sequence", "error");
+    return;
+  }
+  if (seriesExporting) return;
+  seriesExporting = true;
+  cropExportBtn.disabled = true;
+  pauseSeriesPlay();
+  const primary = entries[0][1];
+  const total = primary.frames.length;
+  const restoreIndex = primary.index;
+  const zip = new ZipWriter();
+  try {
+    for (let k = 0; k < total; k += 1) {
+      setStatus(`Exporting frame ${k + 1}/${total}...`);
+      // await: textures decoded AND crops re-rendered (internal .then ran first)
+      await scrubSeriesTo(k);
+      const out = buildCropExportCanvas(region);
+      const blob = await new Promise((resolve) => out.toBlob(resolve, "image/png"));
+      if (!blob) throw new Error("PNG encode failed");
+      zip.add(exportFileNameForFrame(region, primary.frames[k], "png"), new Uint8Array(await blob.arrayBuffer()));
+    }
+    const filename = `${region.name.replace(/\s+/g, "-")}_sequence.zip`;
+    downloadBlob(zip.build(), filename);
+    appendLog(`Exported ${total}-frame sequence as ${filename}`, "ok");
+  } catch (error) {
+    appendLog(`Sequence export failed: ${error.message}`, "error");
+  } finally {
+    scrubSeriesTo(restoreIndex);
+    seriesExporting = false;
+    cropExportBtn.disabled = !activeCrop()?.imageCanvas;
+    setStatus("Ready");
+  }
 }
 
 function closeCrop(id) {
@@ -918,11 +1928,11 @@ function finalizeCropEndpoint(regionId) {
   updateCropDock();
 }
 
-function renderCropImage(region) {
+function renderCropImage(region, maxBase = 620) {
   const xSpan = region.bounds.xMax - region.bounds.xMin;
   const ySpan = region.bounds.yMax - region.bounds.yMin;
   const aspect = clamp(Math.abs(xSpan / ySpan), 0.25, 4.0);
-  const base = Math.max(190, Math.min(620, Math.round(Math.max(Math.abs(xSpan), Math.abs(ySpan)) * 18)));
+  const base = Math.max(190, Math.min(maxBase, Math.round(Math.max(Math.abs(xSpan), Math.abs(ySpan)) * 18)));
   const width = clamp(Math.round(aspect >= 1 ? base : base * aspect), 140, 720);
   const height = clamp(Math.round(aspect >= 1 ? base / aspect : base), 120, 620);
   const image = new ImageData(width, height);
@@ -1069,13 +2079,15 @@ function drawCropAxes(region, g, x0, y0, drawW, drawH) {
   cropCtx.clip();
   cropCtx.strokeStyle = "rgba(210, 226, 238, 0.72)";
   cropCtx.strokeRect(x0, y0, drawW, drawH);
-  cropCtx.strokeStyle = "rgba(135, 210, 164, 0.55)";
-  cropCtx.beginPath();
-  cropCtx.moveTo(g.centerX, margin.top);
-  cropCtx.lineTo(g.centerX, plotBottom);
-  cropCtx.moveTo(margin.left, g.centerY);
-  cropCtx.lineTo(plotRight, g.centerY);
-  cropCtx.stroke();
+  if (showCropCross) {
+    cropCtx.strokeStyle = "rgba(135, 210, 164, 0.55)";
+    cropCtx.beginPath();
+    cropCtx.moveTo(g.centerX, margin.top);
+    cropCtx.lineTo(g.centerX, plotBottom);
+    cropCtx.moveTo(margin.left, g.centerY);
+    cropCtx.lineTo(plotRight, g.centerY);
+    cropCtx.stroke();
+  }
   cropCtx.restore();
 
   const leftLabelX = clamp(sxOf(clamp(ixAt(margin.left), 0, imgW)), margin.left, plotRight);
@@ -1135,7 +2147,7 @@ function setSideTab(tab) {
 }
 
 function lineDrawLayerChoices() {
-  return layers.filter((layer) => layer.kind === "image" && layer.metadata?.render_mode !== "corona" && imageCache.has(layer.id));
+  return layers.filter((layer) => layerMode(layer) === panelMode && layer.kind === "image" && layer.metadata?.render_mode !== "corona" && textureHas(layer));
 }
 
 function beginLineSetup() {
@@ -1150,7 +2162,23 @@ function beginLineSetup() {
     return;
   }
   cancelLineDraw();
-  lineLayerSelect.innerHTML = choices.map((layer) => `<option value="${layer.id}">${escapeHtml(layer.name)}</option>`).join("");
+  // Series member layers expand into time choices: follow the scrubbed frame,
+  // the whole series (time-distance stack), or any single downloaded frame.
+  const options = [];
+  for (const layer of choices) {
+    const entry = seriesLayers.get(layer.id);
+    if (!entry || entry.frames.length < 2) {
+      options.push(`<option value="${layer.id}">${escapeHtml(layer.name)}</option>`);
+      continue;
+    }
+    const name = escapeHtml(layer.name);
+    options.push(`<option value="${layer.id}|current">${name} · current frame</option>`);
+    options.push(`<option value="${layer.id}|series">${name} · whole series (${entry.frames.length} frames)</option>`);
+    entry.frames.forEach((frame, k) => {
+      options.push(`<option value="${layer.id}|frame:${k}">${name} · ${escapeHtml(formatSeriesTime(frame.closest))} UTC</option>`);
+    });
+  }
+  lineLayerSelect.innerHTML = options.join("");
   lineSetup.hidden = false;
   addLineBtn.disabled = true;
 }
@@ -1163,14 +2191,24 @@ function cancelLineSetup() {
 function startLineDraw(mode) {
   const region = activeCrop();
   if (!region) return;
-  const layer = layers.find((item) => item.id === lineLayerSelect.value);
+  const [layerId, spec] = lineLayerSelect.value.split("|");
+  const layer = layers.find((item) => item.id === layerId);
   if (!layer) return;
+  let timeMode = "current";
+  let frameIndex = null;
+  if (spec === "series") timeMode = "series";
+  else if (spec && spec.startsWith("frame:")) {
+    timeMode = "frame";
+    frameIndex = Number(spec.slice(6));
+  }
   cancelLineSetup();
   lineDraw = {
     regionId: region.id,
     mode,
     layerId: layer.id,
     layerName: layer.name,
+    timeMode,
+    frameIndex,
     points: [],
     anchors: [],
     drawing: false,
@@ -1419,6 +2457,8 @@ function editBezierLine(line) {
     mode: "bezier",
     layerId: line.layerId,
     layerName: line.layerName,
+    timeMode: line.timeMode || "current",
+    frameIndex: line.frameIndex ?? null,
     points: [],
     anchors: line.anchors.map((a) => ({ ...a })),
     drawing: false,
@@ -1460,6 +2500,8 @@ function commitLineFromDraw(points, anchors) {
       name: `line ${number}`,
       layerId: lineDraw.layerId,
       layerName: lineDraw.layerName,
+      timeMode: lineDraw.timeMode || "current",
+      frameIndex: lineDraw.frameIndex ?? null,
       mode: lineDraw.mode,
       points,
       anchors,
@@ -1541,8 +2583,17 @@ function renderAnalysisPanel() {
   region.lines.forEach((line) => lineList.appendChild(buildLineRow(region, line)));
 }
 
+function lineTimeTag(line) {
+  const entry = seriesLayers.get(line.layerId);
+  if (!entry) return "";
+  if (line.timeMode === "series") return ` · whole series (${entry.frames.length} frames)`;
+  const frame = entry.frames[line.frameIndex];
+  if (line.timeMode === "frame" && frame) return ` · ${formatSeriesTime(frame.closest)} UTC`;
+  return " · current frame";
+}
+
 function buildLineRow(region, line) {
-  const layerExists = layers.some((item) => item.id === line.layerId && imageCache.has(item.id));
+  const layerExists = layers.some((item) => item.id === line.layerId && textureHas(item));
   const row = document.createElement("div");
   row.className = `line-row${line.collapsed ? " collapsed" : ""}`;
   row.dataset.id = line.id;
@@ -1555,7 +2606,7 @@ function buildLineRow(region, line) {
   dot.style.color = line.color;
   const title = document.createElement("span");
   title.className = "line-title";
-  title.textContent = `${line.name} · ${layerExists ? line.layerName : "missing layer"}`;
+  title.textContent = `${line.name} · ${layerExists ? line.layerName + lineTimeTag(line) : "missing layer"}`;
   title.title = title.textContent;
   head.append(dot, title);
   if (line.mode === "bezier") {
@@ -1735,6 +2786,7 @@ function buildLineRow(region, line) {
   const chart = document.createElement("canvas");
   chart.className = "chart-canvas";
   if (line.plotStrip) {
+    strip.classList.toggle("stack", line.timeMode === "series");
     strip.width = line.plotStrip.width;
     strip.height = line.plotStrip.height;
     strip.getContext("2d").drawImage(line.plotStrip, 0, 0);
@@ -1789,6 +2841,7 @@ function attachPlotToRow(line) {
   const chart = row.querySelector(".chart-canvas");
   if (strip && line.plotStrip) {
     strip.hidden = false;
+    strip.classList.toggle("stack", line.timeMode === "series");
     strip.width = line.plotStrip.width;
     strip.height = line.plotStrip.height;
     strip.getContext("2d").drawImage(line.plotStrip, 0, 0);
@@ -2069,19 +3122,39 @@ function cropImagePointToBase(region, ix, iy) {
 }
 
 function layerSampler(layer) {
-  const tex = imageCache.get(layer.id);
+  const tex = textureGet(layer);
   if (!tex) return null;
   const metadata = layer.metadata || {};
   const textureCenter = metadata.texture_center || [tex.width / 2, tex.height / 2];
   const textureRadius = Number(metadata.texture_radius || Math.min(tex.width, tex.height) / 2);
   const mapping = textureMapping(metadata, Number(textureCenter[0]), Number(textureCenter[1]), textureRadius);
-  return { tex, mapping };
+  const frame = layerObserverFrame(metadata);
+  return { tex, mapping, frame };
+}
+
+// Sampler for one specific downloaded frame of a series member: texture comes
+// from the URL-keyed cache (loaded on demand), mapping from the frame's stored
+// WCS/heliographic record. The observer-frame tilt still references the current
+// base context, so the Carrington anchor cancels through correctly.
+async function frameSampler(layer, frame) {
+  const url = `/data/cache/${frame.png}`;
+  await warmTexture(url, layer.created_at);
+  const tex = imageCache.get(url);
+  if (!tex) return null;
+  const metadata = { ...(layer.metadata || {}), ...(frame.mapping || {}) };
+  const textureCenter = metadata.texture_center || [tex.width / 2, tex.height / 2];
+  const textureRadius = Number(metadata.texture_radius || Math.min(tex.width, tex.height) / 2);
+  const mapping = textureMapping(metadata, Number(textureCenter[0]), Number(textureCenter[1]), textureRadius);
+  const observerFrame = layerObserverFrame(metadata);
+  return { tex, mapping, frame: observerFrame };
 }
 
 function sampleLayerIntensity(sampler, base) {
-  if (!base || base.z < 0) return null;
-  const { tex, mapping } = sampler;
-  const sample = planeToTexture(base.x, base.y, mapping);
+  if (!base) return null;
+  const { tex, mapping, frame } = sampler;
+  const point = frame ? applyObserverFrame(frame, base) : base;
+  if (point.z < 0) return null;
+  const sample = planeToTexture(point.x, point.y, mapping);
   if (sample.tx < 0 || sample.tx >= tex.width || sample.ty < 0 || sample.ty >= tex.height) return null;
   const si = (sample.ty * tex.width + sample.tx) * 4;
   if (tex.data[si + 3] < 13) return null;
@@ -2149,9 +3222,19 @@ function computeLineProfile(region, line, sampler, N, M) {
   return { n: N, m: M, sKm, totalKm: sKm[N - 1], mean, strip };
 }
 
-function generateLinePlot(region, line) {
+async function generateLinePlot(region, line) {
   const layer = layers.find((item) => item.id === line.layerId);
-  const sampler = layer ? layerSampler(layer) : null;
+  if (!layer) {
+    appendLog(`${line.name}: layer missing, cannot plot`, "error");
+    return;
+  }
+  const entry = seriesLayers.get(line.layerId);
+  if (line.timeMode === "series" && entry && entry.frames.length) {
+    await generateSeriesPlot(region, line, layer, entry);
+    return;
+  }
+  const frame = entry && line.timeMode === "frame" ? entry.frames[line.frameIndex] : null;
+  const sampler = frame ? await frameSampler(layer, frame) : layerSampler(layer);
   if (!sampler) {
     appendLog(`${line.name}: layer missing, cannot plot`, "error");
     return;
@@ -2165,7 +3248,207 @@ function generateLinePlot(region, line) {
   line.plotStrip = strip;
   line.plotChart = buildChartCanvas(profile, line);
   attachPlotToRow(line);
-  appendLog(`${line.name}: profile plotted along ${formatKm(profile.totalKm)}`, "ok");
+  const tag = frame ? ` at ${formatSeriesTime(frame.closest)} UTC` : "";
+  appendLog(`${line.name}: profile plotted along ${formatKm(profile.totalKm)}${tag}`, "ok");
+}
+
+// Time-distance analysis ("stack plot"): sample the same Carrington-anchored
+// line at every downloaded frame; stack the band-weighted strip columns side by
+// side so the map's x axis is time and its y axis is distance along the line.
+// The companion chart is the light curve — band-weighted mean intensity of the
+// whole line per frame.
+async function generateSeriesPlot(region, line, layer, entry) {
+  if (!line.points || line.points.length < 2) return;
+  const frames = entry.frames;
+  const K = frames.length;
+  const N = 640;
+  const M = 48;
+  const cols = [];
+  const light = [];
+  for (let k = 0; k < K; k += 1) {
+    setStatus(`${line.name}: sampling frame ${k + 1}/${K}...`);
+    const sampler = await frameSampler(layer, frames[k]);
+    if (!sampler) {
+      cols.push(null);
+      light.push(NaN);
+      continue;
+    }
+    const profile = computeLineProfile(region, line, sampler, N, M);
+    cols.push(profile);
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i < profile.n; i++) {
+      if (Number.isNaN(profile.mean[i])) continue;
+      sum += profile.mean[i];
+      count += 1;
+    }
+    light.push(count ? sum / count : NaN);
+    if (k % 8 === 7) await new Promise((resolve) => setTimeout(resolve, 0)); // keep UI alive
+  }
+  line.plotStrip = buildTimeDistanceCanvas(cols, frames, line);
+  line.plotChart = buildSeriesChartCanvas(light, frames, line);
+  attachPlotToRow(line);
+  appendLog(`${line.name}: time-distance stack over ${K} frames (${formatSeriesTime(frames[0].closest)} → ${formatSeriesTime(frames[K - 1].closest)} UTC)`, "ok");
+  setStatus("Ready");
+}
+
+// Time-distance mosaic: frames side by side (x = time), distance along the
+// line on y. Pure image, no labels — same presentation as single-frame strips.
+// Fixed 640x320 (2:1) so it fills the row like any other strip.
+function buildTimeDistanceCanvas(cols, frames, line) {
+  const K = cols.length;
+  const valid = cols.filter(Boolean);
+  const N = valid.length ? valid[0].n : 1;
+  const M = valid.length ? valid[0].m : 1;
+  const W = 640;
+  const H = 320;
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const g = canvas.getContext("2d");
+  g.fillStyle = "#05090d";
+  g.fillRect(0, 0, W, H);
+  if (!valid.length) {
+    g.fillStyle = "#7d8fa0";
+    g.font = "11px Consolas, monospace";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillText("no valid frames", W / 2, H / 2);
+    return canvas;
+  }
+  // Column k = band-weighted RGB average of frame k's strip (same σ weights as
+  // the profile mean), row i = position along the line, start at the top.
+  const map = new ImageData(K, N);
+  const halfKm = line.widthKm / 2;
+  for (let k = 0; k < K; k++) {
+    const profile = cols[k];
+    if (!profile) continue;
+    for (let i = 0; i < N; i++) {
+      let wSum = 0;
+      let rSum = 0;
+      let gSum = 0;
+      let bSum = 0;
+      for (let j = 0; j < M; j++) {
+        const o = (j * profile.n + i) * 4;
+        if (profile.strip[o + 3] < 13) continue;
+        const d = -halfKm + (j / (M - 1)) * line.widthKm;
+        const w = lineWeight(d, halfKm, line.softness);
+        wSum += w;
+        rSum += w * profile.strip[o];
+        gSum += w * profile.strip[o + 1];
+        bSum += w * profile.strip[o + 2];
+      }
+      const o = (i * K + k) * 4;
+      if (wSum > 0) {
+        map.data[o] = rSum / wSum;
+        map.data[o + 1] = gSum / wSum;
+        map.data[o + 2] = bSum / wSum;
+        map.data[o + 3] = 255;
+      }
+    }
+  }
+  const tmp = document.createElement("canvas");
+  tmp.width = K;
+  tmp.height = N;
+  tmp.getContext("2d").putImageData(map, 0, 0);
+  g.imageSmoothingEnabled = K > 64; // few frames → crisp columns
+  g.imageSmoothingQuality = "high";
+  g.drawImage(tmp, 0, 0, W, H);
+  return canvas;
+}
+
+function buildSeriesChartCanvas(light, frames, line) {
+  const W = 640;
+  const H = 170;
+  const chart = document.createElement("canvas");
+  chart.width = W;
+  chart.height = H;
+  const g = chart.getContext("2d");
+  g.fillStyle = "#05090d";
+  g.fillRect(0, 0, W, H);
+  const K = light.length;
+  let min = Infinity;
+  let max = -Infinity;
+  let validCount = 0;
+  for (let k = 0; k < K; k++) {
+    const v = light[k];
+    if (Number.isNaN(v)) continue;
+    validCount++;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const margin = { left: 46, right: 12, top: 12, bottom: 24 };
+  const plotW = W - margin.left - margin.right;
+  const plotH = H - margin.top - margin.bottom;
+  g.font = "10px Consolas, monospace";
+  if (!validCount) {
+    g.fillStyle = "#7d8fa0";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillText("no valid samples along this line", margin.left + plotW / 2, margin.top + plotH / 2);
+    return chart;
+  }
+  const pad = (max - min || 1) * 0.08;
+  min -= pad;
+  max += pad;
+  g.strokeStyle = "rgba(120, 150, 180, 0.16)";
+  g.lineWidth = 1;
+  g.fillStyle = "#7d8fa0";
+  g.textAlign = "right";
+  g.textBaseline = "middle";
+  for (let k = 0; k <= 4; k++) {
+    const y = margin.top + (plotH * k) / 4;
+    g.beginPath();
+    g.moveTo(margin.left, y);
+    g.lineTo(margin.left + plotW, y);
+    g.stroke();
+    const value = max - ((max - min) * k) / 4;
+    g.fillText(value.toFixed(0), margin.left - 6, y);
+  }
+  g.textAlign = "center";
+  g.textBaseline = "top";
+  g.fillText(formatSeriesTime(frames[0].closest), margin.left + 30, margin.top + plotH + 6);
+  g.fillText(formatSeriesTime(frames[Math.floor((K - 1) / 2)].closest), margin.left + plotW / 2, margin.top + plotH + 6);
+  g.fillText(`${formatSeriesTime(frames[K - 1].closest)} UTC`, margin.left + plotW - 34, margin.top + plotH + 6);
+  g.textAlign = "left";
+  g.fillStyle = "#9fb2c2";
+  g.fillText("mean line intensity vs time (0-255)", margin.left + 4, 2);
+  const color = line.color || "#4aa3ff";
+  g.strokeStyle = color;
+  g.lineWidth = 1.8;
+  g.shadowColor = color;
+  g.shadowBlur = 5;
+  g.beginPath();
+  let pen = false;
+  for (let k = 0; k < K; k++) {
+    const v = light[k];
+    if (Number.isNaN(v)) {
+      pen = false;
+      continue;
+    }
+    const x = margin.left + (K > 1 ? (k / (K - 1)) * plotW : plotW / 2);
+    const y = margin.top + (1 - (v - min) / (max - min)) * plotH;
+    if (!pen) {
+      g.moveTo(x, y);
+      pen = true;
+    } else {
+      g.lineTo(x, y);
+    }
+  }
+  g.stroke();
+  g.shadowBlur = 0;
+  // mark the points too — with few frames a bare line is easy to misread
+  g.fillStyle = color;
+  for (let k = 0; k < K; k++) {
+    const v = light[k];
+    if (Number.isNaN(v)) continue;
+    const x = margin.left + (K > 1 ? (k / (K - 1)) * plotW : plotW / 2);
+    const y = margin.top + (1 - (v - min) / (max - min)) * plotH;
+    g.beginPath();
+    g.arc(x, y, 2.4, 0, Math.PI * 2);
+    g.fill();
+  }
+  return chart;
 }
 
 function buildChartCanvas(profile, line) {
@@ -2251,10 +3534,15 @@ function buildChartCanvas(profile, line) {
 }
 
 function resize() {
+  // While a splitter is being dragged we skip the expensive canvas work and
+  // let CSS stretch the existing bitmap — full per-pixel re-renders on every
+  // pointermove are what made panel/dock resizing feel laggy.
+  if (panelSplitterDrag) return;
   const changed = resizeMainCanvas();
-  resizeCropCanvas();
   updateCoordinateReadout();
   if (changed) scheduleRender();
+  if (cropSideResizeDrag) return;
+  resizeCropCanvas();
   renderCropCanvas();
 }
 
@@ -2335,10 +3623,10 @@ function render() {
     data[i + 3] = 255;
   }
 
-  const visibleLayers = layers.filter((layer) => layer.visible);
+  const visibleLayers = layers.filter((layer) => layer.visible && layerMode(layer) === panelMode);
   for (const layer of visibleLayers) {
     if (layer.kind !== "image") continue;
-    const tex = imageCache.get(layer.id);
+    const tex = textureGet(layer);
     if (!tex) continue;
     const metadata = layer.metadata || {};
     if (metadata.render_mode === "corona") {
@@ -2347,7 +3635,7 @@ function render() {
   }
   for (const layer of visibleLayers) {
     if (layer.kind !== "image") continue;
-    const tex = imageCache.get(layer.id);
+    const tex = textureGet(layer);
     if (!tex) continue;
     const metadata = layer.metadata || {};
     if (metadata.render_mode !== "corona") {
@@ -2356,7 +3644,7 @@ function render() {
   }
 
   ctx.putImageData(out, 0, 0);
-  drawGrid(cx, cy, r);
+  if (showGrid) drawGrid(cx, cy, r);
   for (const layer of visibleLayers) {
     if (layer.kind === "pfss") drawPfss(cx, cy, r, layer.opacity, layer.metadata || {});
   }
@@ -2394,6 +3682,15 @@ function drawTexture(out, w, h, cx, cy, r, tex, opacity, metadata) {
   const qx = -viewQuat.x;
   const qy = -viewQuat.y;
   const qz = -viewQuat.z;
+  // Multi-epoch alignment: transform the base-frame vector into this layer's
+  // own observer frame before sampling (identity for the reference layer).
+  const frame = layerObserverFrame(metadata);
+  const fSbR = frame ? frame.sbR : 0;
+  const fCbR = frame ? frame.cbR : 1;
+  const fSD = frame ? frame.sD : 0;
+  const fCD = frame ? frame.cD : 1;
+  const fSbI = frame ? frame.sbI : 0;
+  const fCbI = frame ? frame.cbI : 1;
 
   for (let py = minY; py <= maxY; py++) {
     const dy = (py - cy) / r;
@@ -2411,10 +3708,22 @@ function drawTexture(out, w, h, cx, cy, r, tex, opacity, metadata) {
       const wx = vx + qw * t2x + (qy * t2z - qz * t2y);
       const wy = vy + qw * t2y + (qz * t2x - qx * t2z);
       const wz = vz + qw * t2z + (qx * t2y - qy * t2x);
-      if (wz < 0 || wx * wx + wy * wy > 1.02) continue;
+      let sx = wx;
+      let sy = wy;
+      let sz = wz;
+      if (frame) {
+        const hy = fCbR * wy + fSbR * wz;
+        const hz = -fSbR * wy + fCbR * wz;
+        const hx = wx * fCD - hz * fSD;
+        const hz2 = wx * fSD + hz * fCD;
+        sx = hx;
+        sy = fCbI * hy - fSbI * hz2;
+        sz = fSbI * hy + fCbI * hz2;
+      }
+      if (sz < 0 || sx * sx + sy * sy > 1.02) continue;
 
-      const sampleX = mC * wx + mS * wy;
-      const sampleY = -mS * wx + mC * wy;
+      const sampleX = mC * sx + mS * sy;
+      const sampleY = -mS * sx + mC * sy;
       const tx = Math.max(0, Math.min(tw - 1, Math.floor(mCx + sampleX * mRx - mCrX)));
       const ty = Math.max(0, Math.min(th - 1, Math.floor(mCy - sampleY * mRy + mCrY)));
       const si = (ty * tw + tx) * 4;
@@ -2494,16 +3803,19 @@ function drawCoronaTexture(out, w, h, cx, cy, r, tex, opacity, metadata) {
 function sampleVisibleSurfaceLayers(basePoint) {
   if (basePoint.z < 0) return [5, 7, 10, 255];
   let out = [5, 7, 10, 255];
-  const visibleLayers = layers.filter((layer) => layer.visible && layer.kind === "image");
+  const visibleLayers = layers.filter((layer) => layer.visible && layerMode(layer) === panelMode && layer.kind === "image");
   for (const layer of visibleLayers) {
-    const tex = imageCache.get(layer.id);
+    const tex = textureGet(layer);
     if (!tex) continue;
     const metadata = layer.metadata || {};
     if (metadata.render_mode === "corona") continue;
+    const frame = layerObserverFrame(metadata);
+    const point = frame ? applyObserverFrame(frame, basePoint) : basePoint;
+    if (point.z < 0) continue;  // this spot was on the far side for that epoch
     const textureCenter = metadata.texture_center || [tex.width / 2, tex.height / 2];
     const textureRadius = Number(metadata.texture_radius || Math.min(tex.width, tex.height) / 2);
     const mapping = textureMapping(metadata, Number(textureCenter[0]), Number(textureCenter[1]), textureRadius);
-    const sample = planeToTexture(basePoint.x, basePoint.y, mapping);
+    const sample = planeToTexture(point.x, point.y, mapping);
     if (sample.tx < 0 || sample.tx >= tex.width || sample.ty < 0 || sample.ty >= tex.height) continue;
     const si = (sample.ty * tex.width + sample.tx) * 4;
     const a = (tex.data[si + 3] / 255) * clamp(layer.opacity, 0, 1);
@@ -2513,6 +3825,46 @@ function sampleVisibleSurfaceLayers(basePoint) {
     out[2] = out[2] * (1 - a) + tex.data[si + 2] * a;
   }
   return out;
+}
+
+// --- multi-epoch alignment --------------------------------------------------
+// The first visible image layer defines the base frame (its observer sits at
+// Carrington lon centralLon, lat centerLat — see carringtonContext). Any other
+// layer's texture is sampled in its OWN observer frame: tilt the base vector
+// out of the reference frame, rotate about the solar axis by the Carrington
+// longitude difference, then tilt into the layer's frame. For the reference
+// layer itself (and same-epoch stacks) this is an identity transform.
+function layerObserverFrame(metadata) {
+  const helio = metadata?.heliographic || {};
+  let lon = Number(helio.carrington_lon_obs);
+  if (!Number.isFinite(lon)) {
+    const dateText = helio.date_obs || metadata?.closest_date || metadata?.date || metadata?.requestedDate || "";
+    if (!dateText) return null;  // no ephemeris at all: sample as-is
+    lon = estimateCarringtonCentralLongitude(dateText);
+  }
+  let lat = Number(helio.carrington_lat_obs ?? helio.stonyhurst_lat_obs);
+  if (!Number.isFinite(lat)) lat = 0;
+  const ref = carringtonContext();
+  const b0r = ref.centerLat * DEG2RAD;
+  const dLon = (normalize360(lon) - ref.centralLon) * DEG2RAD;
+  const b0i = lat * DEG2RAD;
+  return {
+    sbR: Math.sin(b0r), cbR: Math.cos(b0r),
+    sD: Math.sin(dLon), cD: Math.cos(dLon),
+    sbI: Math.sin(b0i), cbI: Math.cos(b0i),
+  };
+}
+
+function applyObserverFrame(frame, v) {
+  const hy = frame.cbR * v.y + frame.sbR * v.z;
+  const hz = -frame.sbR * v.y + frame.cbR * v.z;
+  const hx = v.x * frame.cD - hz * frame.sD;
+  const hz2 = v.x * frame.sD + hz * frame.cD;
+  return {
+    x: hx,
+    y: frame.cbI * hy - frame.sbI * hz2,
+    z: frame.sbI * hy + frame.cbI * hz2,
+  };
 }
 
 function textureMapping(metadata, tcx, tcy, fallbackRadius) {
@@ -2660,6 +4012,8 @@ function drawLimb(cx, cy, r) {
 }
 
 function drawCropOverlay(cx, cy, r) {
+  // Region outlines always show (Hide region hides them per region); the
+  // in-progress drag preview and its dashed guide show too (active feedback).
   const overlays = cropRegions.filter((region) => !region.hiddenOnDisk);
   if (cropDrag?.start && cropDrag?.current) {
     const preview = buildCropRegion(cropDrag.start, cropDrag.current);
@@ -3027,7 +4381,7 @@ function pfssContext() {
 }
 
 function firstVisibleImageMetadata() {
-  const layer = layers.find((item) => item.visible && item.kind === "image" && item.metadata?.heliographic);
+  const layer = layers.find((item) => item.visible && layerMode(item) === panelMode && item.kind === "image" && item.metadata?.heliographic);
   return layer?.metadata || null;
 }
 
