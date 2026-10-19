@@ -1585,3 +1585,19 @@ canvas {
 .panel > #seriesLibrary {
   min-height: 132px;
 }
+.series-preparation {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px;
+  background: rgba(5, 7, 10, .85);
+  border-radius: 5px;
+  color: #b7c9d8;
+  font-size: 12px;
+  pointer-events: none;
+}
+.series-preparation[hidden] { display: none; }
+.series-preparation progress { width: 92px; height: 6px; accent-color: #4aa3ff; }

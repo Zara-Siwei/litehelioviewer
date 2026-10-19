@@ -118,6 +118,11 @@ async def no_cache_for_ui(request, call_next):
     response = await call_next(request)
     if request.url.path in {"/", "/static/app.js", "/static/style.css", "/static/index.html"}:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    elif request.url.path.startswith("/data/"):
+        # Cache files are immutable per filename (frame timestamp baked in), so
+        # let the browser keep them: kills revalidation round-trips when series
+        # playback re-warms frames after an eviction.
+        response.headers["Cache-Control"] = "public, max-age=86400"
     return response
 
 

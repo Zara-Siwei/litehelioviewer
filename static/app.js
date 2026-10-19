@@ -585,6 +585,11 @@ async function loadPresets() {
 async function refreshLayers() {
   const data = await api("/api/layers");
   layers = data.layers || [];
+  await Promise.all(layers.filter(layer => seriesLayers.has(layer.id)).map(layer => {
+    const entry = seriesLayers.get(layer.id);
+    const frame = entry.frames[entry.index];
+    return frame ? warmTexture(`/data/cache/${frame.png}`, '', SERIES_TEXTURE_MAX_DIM) : Promise.resolve();
+  }));
   applySeriesOverrides();
   renderLayerList();
   await loadLayerImages();
@@ -600,6 +605,42 @@ async function loadLayerImages() {
 // a layer's frame URL and keep previously decoded frames warm; LRU-capped
 // since a long series would otherwise grow memory without bound.
 const TEXTURE_CACHE_CAP = 40;
+// Series frames are stored at display resolution (they are sampled onto a
+// ~1000 px canvas anyway): 4096² sources decode+readback once per frame at
+// full res cost ~100-300 ms each and 67 MB of pixel data — with a 75-frame
+// series that both blew the old 40-entry LRU (every loop re-decoded every
+// frame: the stutter) and would have needed gigabytes. 1024² ≈ 4 MB per
+// frame, so the whole series fits and loops stay warm.
+const SERIES_TEXTURE_MAX_DIM = 1024;
+const TEXTURE_CACHE_MAX_CAP = 512; // ~2 GB worst case at 1024² RGBA
+const DISPLAY_TEXTURE_BYTES = 1024 * 1024 * 1024;
+const FULL_TEXTURE_BYTES = 384 * 1024 * 1024;
+const textureInflight = new Map(); // cacheKey -> Promise (decode de-duplication)
+
+function seriesTextureUrls(seriesId) {
+  return [...new Set(seriesEntriesFor(seriesId).flatMap(([, e]) => e.frames.map(f => `/data/cache/${f.png}`)))];
+}
+
+function canPrepareWholeSeries(seriesId) {
+  const urls = new Set(seriesTextureUrls(seriesId));
+  for (const layer of modeLayers()) if (layer.kind === 'image' && layer.image_url) urls.add(layer.image_url);
+  const count = urls.size;
+  return count <= TEXTURE_CACHE_MAX_CAP && count * SERIES_TEXTURE_MAX_DIM ** 2 * 4 <= DISPLAY_TEXTURE_BYTES;
+}
+
+// The LRU must hold every frame of every loaded series (times the members),
+// otherwise cyclic playback evicts frames right before they are needed again.
+function textureCacheCap() {
+  let seriesFrames = 0;
+  for (const entry of seriesLayers.values()) seriesFrames += entry.frames.length;
+  return Math.min(TEXTURE_CACHE_MAX_CAP, Math.max(TEXTURE_CACHE_CAP, seriesFrames + 8));
+}
+
+// Scale from stored (possibly downscaled) texture pixels back to the original
+// image pixel space that WCS/texture_center metadata refers to.
+function texScale(tex) {
+  return tex && tex.sourceWidth ? tex.width / tex.sourceWidth : 1;
+}
 
 function textureKey(layer) {
   return layer.image_url || layer.id;
@@ -618,37 +659,105 @@ function textureGet(layer) {
   return value;
 }
 
+// Crop/analysis samplers prefer the full-resolution tier ("url#full", warmed
+// on pause/export) and fall back to the display tier used for playback.
+function textureGetPreferFull(layer) {
+  const fullKey = `${textureKey(layer)}#full`;
+  if (!isSeriesPlaying() && imageCache.has(fullKey)) return textureGet({ image_url: fullKey, id: fullKey });
+  return textureGet(layer);
+}
+
 function textureSet(layer, texture) {
   const key = textureKey(layer);
   imageCache.delete(key);
   imageCache.set(key, texture);
-  while (imageCache.size > TEXTURE_CACHE_CAP) {
-    imageCache.delete(imageCache.keys().next().value);
+  // Full-size analysis/export frames must never evict the prepared loop.
+  // Bound bytes as well as entries: a 4096² RGBA frame occupies 64 MiB.
+  const full = key.endsWith("#full");
+  const tier = [...imageCache.entries()].filter(([k]) => k.endsWith("#full") === full);
+  let bytes = tier.reduce((n, [, t]) => n + t.data.byteLength, 0);
+  let count = tier.length;
+  const budget = full ? FULL_TEXTURE_BYTES : DISPLAY_TEXTURE_BYTES;
+  const cap = full ? 6 : textureCacheCap();
+  const pinned = new Set(!full && canPrepareWholeSeries(activeSeriesId) ? seriesTextureUrls(activeSeriesId) : []);
+  if (!full) for (const layer of modeLayers()) if (layer.image_url) pinned.add(layer.image_url);
+  const candidates = [...tier.filter(([k]) => !pinned.has(k)), ...tier.filter(([k]) => pinned.has(k))];
+  for (const [k, t] of candidates) {
+    if (bytes <= budget && count <= cap) break;
+    if (k === key) continue; // allow one unusually large source to remain usable
+    imageCache.delete(k);
+    bytes -= t.data.byteLength;
+    count -= 1;
   }
 }
 
-function loadLayerImage(layer) {
-  if (textureHas(layer)) return Promise.resolve();
-  return new Promise((resolve) => {
+// Decode one image URL into the cache. maxDim > 0 downscales the stored
+// texture so its longest side is at most maxDim (display tier); maxDim = 0
+// keeps full resolution. Concurrent calls for the same cacheKey share one
+// decode instead of racing duplicate ones.
+function warmTexture(url, tag, maxDim = 0, cacheKey = url) {
+  if (imageCache.has(cacheKey)) return Promise.resolve(true);
+  if (textureInflight.has(cacheKey)) return textureInflight.get(cacheKey);
+  const promise = new Promise((resolve) => {
     const img = new Image();
+    const finish = (ok) => {
+      clearTimeout(timeout);
+      img.onload = img.onerror = null;
+      img.src = "";
+      textureInflight.delete(cacheKey);
+      resolve(ok);
+    };
+    const timeout = setTimeout(() => finish(false), 30000);
     img.crossOrigin = "anonymous";
     img.onload = () => {
+      try {
+      const sw = img.naturalWidth;
+      const sh = img.naturalHeight;
+      const k = maxDim > 0 ? Math.min(1, maxDim / Math.max(sw, sh)) : 1;
       const off = document.createElement("canvas");
-      off.width = img.naturalWidth;
-      off.height = img.naturalHeight;
+      off.width = Math.max(1, Math.round(sw * k));
+      off.height = Math.max(1, Math.round(sh * k));
       const offCtx = off.getContext("2d", { willReadFrequently: true });
-      offCtx.drawImage(img, 0, 0);
-      textureSet(layer, {
+      offCtx.drawImage(img, 0, 0, off.width, off.height);
+      textureSet({ image_url: cacheKey, id: cacheKey }, {
         width: off.width,
         height: off.height,
+        sourceWidth: sw,
+        sourceHeight: sh,
         data: offCtx.getImageData(0, 0, off.width, off.height).data,
       });
-      scheduleRender(); // scrub paths don't await loads; paint when ready
-      resolve();
+      off.width = off.height = 0; // release the temporary full-size canvas
+      finish(true);
+      } catch (error) {
+        appendLog(`Image decode failed: ${error.message}`, "error");
+        finish(false);
+      }
     };
-    img.onerror = () => resolve();
-    img.src = `${layer.image_url}?t=${encodeURIComponent(layer.created_at || "")}`;
+    img.onerror = () => {
+      finish(false);
+    };
+    // Cached frame paths are immutable. Layer creation times only defeated
+    // browser caching when the same history was loaded a second time.
+    img.src = url;
   });
+  textureInflight.set(cacheKey, promise);
+  return promise;
+}
+
+function loadLayerImage(layer) {
+  const url = layer.image_url;
+  const tag = layer.created_at;
+  if (seriesLayers.has(layer.id)) {
+    // Series members only need the display tier; full resolution is warmed on
+    // demand (pause, export, single-frame analysis).
+    return warmTexture(url, tag, SERIES_TEXTURE_MAX_DIM).then(() => scheduleRender());
+  }
+  // Standalone (single-frame) layers: display tier for the main view, plus the
+  // full-resolution tier up front so crops and line analysis stay lossless.
+  return Promise.all([
+    warmTexture(url, tag, SERIES_TEXTURE_MAX_DIM),
+    warmTexture(url, tag, 0, `${url}#full`),
+  ]).then(() => scheduleRender());
 }
 
 function layerFrameInfo(layer) {
@@ -683,7 +792,7 @@ function renderLayerList() {
     return;
   }
   layersEl.innerHTML = shown.map((layer) => `
-    <div class="layer">
+    <div class="layer" data-id="${layer.id}">
       <div class="layer-head">
         <input type="checkbox" ${layer.visible ? "checked" : ""} data-action="visible" data-id="${layer.id}" />
         <div class="layer-name" title="${escapeHtml(layer.name)}">${escapeHtml(layer.name)}</div>
@@ -700,6 +809,17 @@ function renderLayerList() {
   layersEl.querySelectorAll("[data-action='visible'], [data-action='delete']").forEach((el) => {
     el.addEventListener("click", handleLayerInput);
   });
+}
+
+// Per-frame refresh during playback: swapping the date div's outerHTML leaves
+// the opacity slider and checkbox untouched, unlike a full renderLayerList()
+// rebuild at every scrub step (DOM churn at 5-20 fps).
+function updateSeriesLayerDates() {
+  for (const layer of modeLayers()) {
+    if (!seriesLayers.has(layer.id)) continue;
+    const host = layersEl.querySelector(`.layer[data-id="${layer.id}"] .layer-date`);
+    if (host) host.outerHTML = layerDateHtml(layer);
+  }
 }
 
 // Opacity sliders: while dragging we must NOT rebuild the layer list (that would
@@ -1113,14 +1233,28 @@ async function retrySeries(seriesId) {
   await refreshSeriesList();
 }
 
+let seriesLoadPending = false;
 async function loadSeries(seriesId) {
+  if (seriesLoadPending) return;
+  seriesLoadPending = true;
   pauseSeriesPlay();
+  ++seriesWarmToken;
+  seriesWarmJob = null;
   setStatus("Loading series...");
   try {
     const detail = await api(`/api/series/${seriesId}`);
     const members = (detail.members || []).filter((member) => (member.frames || []).length > 0);
     if (!members.length) throw new Error("Series has no downloaded frames");
     for (const member of members) {
+      const memberKey = `${member.server}/${member.preset}`;
+      const existing = seriesEntriesFor(seriesId).find(([, e]) => e.memberKey === memberKey)?.[1];
+      if (existing) {
+        const currentTime = existing.frames[existing.index]?.closest;
+        existing.frames = member.frames;
+        const currentIndex = member.frames.findIndex(f => f.closest === currentTime);
+        existing.index = currentIndex < 0 ? 0 : currentIndex;
+        continue;
+      }
       const frame = member.frames[0];
       const result = await api("/api/load/helioviewer", {
         method: "POST",
@@ -1136,17 +1270,21 @@ async function loadSeries(seriesId) {
       });
       const layerId = result.layer?.id;
       if (layerId) {
-        seriesLayers.set(layerId, { seriesId, frames: member.frames, index: 0 });
+        seriesLayers.set(layerId, { seriesId, memberKey, frames: member.frames, index: 0 });
       }
     }
     activeSeriesId = seriesId;
     appendLog(`Series loaded: ${detail.name} (${members.length} layer(s), ${members[0].frames.length} steps)`);
     await refreshLayers();
     refreshSeriesCrops(); // re-anchor any existing crops to frame 0
+    scheduleFullResCropRefresh();
+    warmAllSeriesFrames(seriesId); // background pre-decode so playback loops warm
     setStatus("Series loaded");
   } catch (error) {
     setStatus("Series load failed");
     appendLog(error.message, "error");
+  } finally {
+    seriesLoadPending = false;
   }
 }
 
@@ -1192,25 +1330,7 @@ function applySeriesOverrides() {
     if (!frame) continue;
     const mapping = frame.mapping || {};
     const nextUrl = `/data/cache/${frame.png}`;
-    // Never blank the layer: if the target frame's texture is not decoded yet
-    // (first playback after startup warms the cache on the fly), keep the
-    // previous frame on screen and swap URL + metadata once it arrives.
-    if (layer.image_url && layer.image_url !== nextUrl && !imageCache.has(nextUrl)) {
-      warmTexture(nextUrl, layer.created_at).then(() => {
-        const current = seriesLayers.get(layer.id);
-        if (!current || current.frames[current.index] !== frame) return;
-        layer.image_url = nextUrl;
-        layer.metadata = {
-          ...layer.metadata,
-          ...mapping,
-          requestedDate: frame.requested,
-          date: mapping.closest_date || frame.closest,
-          series: { id: entry.seriesId },
-        };
-        scheduleRender();
-      });
-      continue;
-    }
+    if (!imageCache.has(nextUrl)) continue;
     layer.image_url = nextUrl;
     layer.metadata = {
       ...layer.metadata,
@@ -1224,35 +1344,45 @@ function applySeriesOverrides() {
 
 // Scrub by primary-member frame index; every other member snaps to the frame
 // closest in time (members may have different counts after dedupe).
+let seriesScrubToken = 0;
 function scrubSeriesTo(index) {
-  const entries = seriesEntriesFor(activeSeriesId);
-  if (!entries.length) return;
+  const seriesId = activeSeriesId;
+  const entries = seriesEntriesFor(seriesId);
+  if (!entries.length) return Promise.resolve(false);
+  const token = ++seriesScrubToken;
   const primary = entries[0][1];
   const clamped = clamp(index, 0, primary.frames.length - 1);
   const targetMs = Date.parse(primary.frames[clamped].closest) || 0;
-  for (const [, entry] of entries) {
-    let best = 0;
-    let bestDelta = Infinity;
+  const targets = entries.map(([layerId, entry]) => {
+    let best = 0, bestDelta = Infinity;
     entry.frames.forEach((frame, i) => {
       const delta = Math.abs((Date.parse(frame.closest) || 0) - targetMs);
-      if (delta < bestDelta) {
-        bestDelta = delta;
-        best = i;
-      }
+      if (delta < bestDelta) { bestDelta = delta; best = i; }
     });
-    entry.index = best;
-  }
-  applySeriesOverrides();
-  renderLayerList();
-  syncSeriesCropFrames();
-  const cropToken = ++cropSeriesToken;
-  const pending = loadLayerImages();
-  pending.then(() => {
-    if (cropToken === cropSeriesToken) refreshSeriesCrops();
+    return { layerId, entry, index: best, url: `/data/cache/${entry.frames[best].png}` };
   });
-  scheduleRender();
-  updateSeriesBar();
-  return pending; // resolves when frame textures are decoded (crop refresh ran first)
+  const commit = () => {
+    if (token !== seriesScrubToken || seriesId !== activeSeriesId ||
+        targets.some(t => seriesLayers.get(t.layerId) !== t.entry)) return false;
+    if (targets.some(t => !imageCache.has(t.url))) return false;
+    // Commit all bands, metadata, timestamps and crops in the same turn.
+    for (const t of targets) t.entry.index = t.index;
+    applySeriesOverrides();
+    if (isSeriesPlaying()) updateSeriesLayerDates();
+    else renderLayerList();
+    ++cropSeriesToken;
+    refreshSeriesCrops();
+    if (!isSeriesPlaying()) scheduleFullResCropRefresh();
+    scheduleRender();
+    updateSeriesBar();
+    return true;
+  };
+  if (targets.every(t => imageCache.has(t.url))) return Promise.resolve(commit());
+  return Promise.all(targets.map(t => warmTexture(t.url, '', SERIES_TEXTURE_MAX_DIM))).then(() => {
+    const ok = commit();
+    if (!ok && token === seriesScrubToken) setStatus('Frame unavailable — kept previous frame');
+    return ok;
+  });
 }
 
 // --- crop regions follow the series frame -------------------------------------
@@ -1303,6 +1433,7 @@ function updateSeriesBar() {
   if (!entries.length || panelMode !== "series") {
     pauseSeriesPlay();
     seriesBar.hidden = true;
+    document.getElementById("seriesPreparation").hidden = true;
     seriesBar.classList.remove("concealed");
     if (seriesBarConcealTimer) {
       clearTimeout(seriesBarConcealTimer);
@@ -1320,6 +1451,7 @@ function updateSeriesBar() {
   seriesBarTime.textContent = frame ? `${formatSeriesTime(frame.closest)} UTC` : "";
   seriesBarCount.textContent = `${primary.index + 1} / ${primary.frames.length}`;
   seriesBar.hidden = false;
+  document.getElementById("seriesPreparation").hidden = !document.getElementById("seriesPreparationText").textContent;
   revealSeriesBar();
   if (!isSeriesPlaying()) concealSeriesBarSoon(2600);
 }
@@ -1373,40 +1505,54 @@ function toggleSeriesPlay() {
   else startSeriesPlay();
 }
 
-function startSeriesPlay() {
+let seriesPlaybackToken = 0;
+async function startSeriesPlay() {
   const entries = seriesEntriesFor(activeSeriesId);
-  if (!entries.length) return;
-  const primary = entries[0][1];
-  if (primary.frames.length < 2) return;
+  if (!entries.length || entries[0][1].frames.length < 2) return;
   pauseSeriesPlay();
+  clearTimeout(fullResCropTimer);
+  const token = ++seriesPlaybackToken;
+  const seriesId = activeSeriesId;
+  seriesPlayTimer = -1; // preparation is cancellable with the same Pause button
   seriesPlayBtn.textContent = "❚❚";
   seriesPlayBtn.title = "Pause";
   seriesPlayBtn.classList.add("playing");
-  seriesPlayTimer = setInterval(() => {
-    const current = seriesEntriesFor(activeSeriesId);
-    if (!current.length) {
-      pauseSeriesPlay();
-      return;
-    }
+  revealSeriesBar();
+  const ready = await warmAllSeriesFrames(seriesId);
+  if (token !== seriesPlaybackToken || seriesId !== activeSeriesId) return;
+  if (!ready) { pauseSeriesPlay(); return; }
+  const tick = async () => {
+    if (token !== seriesPlaybackToken || seriesId !== activeSeriesId) return;
+    const current = seriesEntriesFor(seriesId);
+    if (!current.length) { pauseSeriesPlay(); return; }
+    const started = performance.now();
     const stack = current[0][1];
-    scrubSeriesTo((stack.index + 1) % stack.frames.length); // loop
-    warmSeriesFrames();
-  }, 1000 / seriesPlayFps);
-  warmSeriesFrames();
-  revealSeriesBar(); // pinned visible while playing
+    const ok = await scrubSeriesTo((stack.index + 1) % stack.frames.length);
+    if (token !== seriesPlaybackToken) return;
+    if (!ok) { pauseSeriesPlay(); return; }
+    // Let the scheduled projection/crop paint finish before queuing another
+    // step. Slow frames reduce achieved fps; they never stack up or get skipped.
+    await new Promise(requestAnimationFrame);
+    if (token !== seriesPlaybackToken) return;
+    seriesPlayTimer = setTimeout(tick, Math.max(0, 1000 / seriesPlayFps - (performance.now() - started)));
+  };
+  seriesPlayTimer = setTimeout(tick, 1000 / seriesPlayFps);
 }
 
 function pauseSeriesPlay() {
   const wasPlaying = seriesPlayTimer !== null;
-  if (wasPlaying) {
-    clearInterval(seriesPlayTimer);
-    seriesPlayTimer = null;
-  }
+  ++seriesPlaybackToken;
+  ++seriesScrubToken; // a late decode cannot advance after Pause
+  if (wasPlaying) clearTimeout(seriesPlayTimer);
+  seriesPlayTimer = null;
   seriesPlayBtn.textContent = "▶";
   seriesPlayBtn.title = "Play";
   seriesPlayBtn.classList.remove("playing");
-  if (wasPlaying) refreshSeriesCrops(); // restore full-resolution patch
-  if (wasPlaying) concealSeriesBarSoon(1200);
+  if (wasPlaying) {
+    refreshSeriesCrops();
+    scheduleFullResCropRefresh();
+    concealSeriesBarSoon(1200);
+  }
 }
 
 function stepSeriesFrame(delta) {
@@ -1416,40 +1562,88 @@ function stepSeriesFrame(delta) {
   scrubSeriesTo(primary.index + delta); // clamped inside scrubSeriesTo
 }
 
-// Pre-decode the next few frames of every loaded member so playback does not
-// stutter on the first pass; the URL-keyed LRU texture cache keeps them warm.
-function warmSeriesFrames() {
-  for (const [layerId, entry] of seriesEntriesFor(activeSeriesId)) {
-    const layer = layers.find((item) => item.id === layerId);
-    const tag = layer ? layer.created_at : "";
-    for (let k = 1; k <= SERIES_PLAY_LOOKAHEAD; k += 1) {
-      const frame = entry.frames[(entry.index + k) % entry.frames.length];
-      if (frame) warmTexture(`/data/cache/${frame.png}`, tag);
-    }
-  }
+// One bounded, reusable preparation job per active frame list.
+let seriesWarmToken = 0;
+let seriesWarmJob = null;
+function updateSeriesPreparation(done, total, label) {
+  const el = document.getElementById('seriesPreparation');
+  el.hidden = panelMode !== 'series';
+  document.getElementById('seriesPreparationProgress').max = Math.max(1, total);
+  document.getElementById('seriesPreparationProgress').value = done;
+  document.getElementById('seriesPreparationText').textContent = `${label} ${done} / ${total}`;
 }
 
-function warmTexture(url, tag) {
-  if (imageCache.has(url)) return Promise.resolve();
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => {
-      const off = document.createElement("canvas");
-      off.width = img.naturalWidth;
-      off.height = img.naturalHeight;
-      const offCtx = off.getContext("2d", { willReadFrequently: true });
-      offCtx.drawImage(img, 0, 0);
-      textureSet({ image_url: url, id: url }, {
-        width: off.width,
-        height: off.height,
-        data: offCtx.getImageData(0, 0, off.width, off.height).data,
-      });
-      resolve();
-    };
-    img.onerror = () => resolve();
-    img.src = `${url}?t=${encodeURIComponent(tag || "")}`;
-  });
+function warmAllSeriesFrames(seriesId) {
+  const entries = seriesEntriesFor(seriesId);
+  if (!entries.length) return Promise.resolve(false);
+  const whole = canPrepareWholeSeries(seriesId);
+  // Large histories use a bounded initial window; never claim the whole
+  // sequence is ready if it cannot fit in the display cache.
+  const urls = [];
+  const maxLen = whole ? Math.max(...entries.map(([, e]) => e.frames.length)) : SERIES_PLAY_LOOKAHEAD + 1;
+  for (let k = 0; k < maxLen; k++) {
+    for (const [, e] of entries) {
+      const frame = whole ? e.frames[k] : e.frames[(e.index + k) % e.frames.length];
+      if (frame) urls.push(`/data/cache/${frame.png}`);
+    }
+  }
+  const unique = [...new Set(urls)];
+  const key = JSON.stringify([seriesId, unique]);
+  if (seriesWarmJob && seriesWarmJob.key === key) return seriesWarmJob.promise;
+  const token = ++seriesWarmToken;
+  const promise = (async () => {
+    let done = unique.filter(url => imageCache.has(url)).length;
+    updateSeriesPreparation(done, unique.length, whole ? 'Preparing' : 'Buffering');
+    for (const url of unique) {
+      if (token !== seriesWarmToken || seriesId !== activeSeriesId || !seriesEntriesFor(seriesId).length) return false;
+      if (imageCache.has(url)) continue;
+      const ok = await warmTexture(url, '', SERIES_TEXTURE_MAX_DIM);
+      if (token !== seriesWarmToken) return false;
+      if (!ok) {
+        updateSeriesPreparation(done, unique.length, 'Image failed — press Play to retry');
+        return false;
+      }
+      done++;
+      updateSeriesPreparation(done, unique.length, whole ? 'Preparing' : 'Buffering');
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    const ready = unique.every(url => imageCache.has(url));
+    updateSeriesPreparation(ready ? unique.length : done, unique.length,
+      ready ? (whole ? 'Ready' : 'Buffered · large series loads as needed') : 'Buffer incomplete');
+    return ready;
+  })();
+  seriesWarmJob = { key, promise };
+  promise.finally(() => { if (seriesWarmJob?.promise === promise) seriesWarmJob = null; });
+  return promise;
+}
+
+// Full-resolution tier ("url#full") for the frames currently on screen: used
+// by crop patches and analysis when paused, and by sequence export. Only a
+// handful of frames ever exist at this tier, so memory stays bounded.
+async function warmFullResCurrentFrames() {
+  const jobs = [];
+  for (const [layerId, entry] of seriesLayers.entries()) {
+    const layer = layers.find((item) => item.id === layerId);
+    const frame = entry.frames[entry.index];
+    if (!frame) continue;
+    const url = `/data/cache/${frame.png}`;
+    jobs.push(warmTexture(url, layer ? layer.created_at : "", 0, `${url}#full`));
+  }
+  await Promise.all(jobs);
+}
+
+let fullResCropTimer = null;
+function scheduleFullResCropRefresh() {
+  if (!cropRegions.length) return;
+  clearTimeout(fullResCropTimer);
+  fullResCropTimer = setTimeout(() => {
+    fullResCropTimer = null;
+    if (isSeriesPlaying() || panelMode !== "series") return;
+    const token = cropSeriesToken;
+    warmFullResCurrentFrames().then(() => {
+      if (!isSeriesPlaying() && token === cropSeriesToken) refreshSeriesCrops();
+    });
+  }, 250);
 }
 
 async function uploadFits(file) {
@@ -1476,6 +1670,9 @@ async function uploadFits(file) {
 async function clearLayers() {
   // Clear only the current mode's stack — the other mode keeps its layers.
   await fetch(`/api/layers?mode=${panelMode}`, { method: "DELETE" });
+  ++seriesWarmToken;
+  seriesWarmJob = null;
+  pauseSeriesPlay();
   imageCache.clear();
   appendLog(panelMode === "series" ? "Cleared series layers" : "Cleared all layers");
   await refreshLayers();
@@ -1535,6 +1732,7 @@ function finishCropDrag() {
   }
   renderCropImage(region);
   cropRegions.push(region);
+  if (panelMode === 'series' && !isSeriesPlaying()) scheduleFullResCropRefresh();
   activeCropId = region.id;
   cropDockHidden = false;
   updateCropDock();
@@ -1811,6 +2009,11 @@ async function exportCropSequence() {
       setStatus(`Exporting frame ${k + 1}/${total}...`);
       // await: textures decoded AND crops re-rendered (internal .then ran first)
       await scrubSeriesTo(k);
+      // export at source resolution: warm the full tier, then re-sample the patch
+      await warmFullResCurrentFrames();
+      const view = region.view;
+      renderCropImage(region, 620);
+      if (view) region.view = view;
       const out = buildCropExportCanvas(region);
       const blob = await new Promise((resolve) => out.toBlob(resolve, "image/png"));
       if (!blob) throw new Error("PNG encode failed");
@@ -1952,6 +2155,7 @@ function renderCropImage(region, maxBase = 620) {
   const height = clamp(Math.round(aspect >= 1 ? base / aspect : base), 120, 620);
   const image = new ImageData(width, height);
   const data = image.data;
+  const samplers = surfaceLayerSamplers(); // WCS and layer lookup once per crop, not per pixel
   for (let py = 0; py < height; py++) {
     const fy = (py + 0.5) / height;
     const y = region.bounds.yMax - fy * ySpan;
@@ -1959,7 +2163,7 @@ function renderCropImage(region, maxBase = 620) {
       const fx = (px + 0.5) / width;
       const x = region.bounds.xMin + fx * xSpan;
       const basePoint = localCeaToBaseVector(x, y, region.frame);
-      const color = sampleVisibleSurfaceLayers(basePoint);
+      const color = sampleVisibleSurfaceLayers(basePoint, samplers);
       const i = (py * width + px) * 4;
       data[i] = color[0];
       data[i + 1] = color[1];
@@ -3137,12 +3341,14 @@ function cropImagePointToBase(region, ix, iy) {
 }
 
 function layerSampler(layer) {
-  const tex = textureGet(layer);
+  const tex = textureGetPreferFull(layer);
   if (!tex) return null;
   const metadata = layer.metadata || {};
-  const textureCenter = metadata.texture_center || [tex.width / 2, tex.height / 2];
-  const textureRadius = Number(metadata.texture_radius || Math.min(tex.width, tex.height) / 2);
-  const mapping = textureMapping(metadata, Number(textureCenter[0]), Number(textureCenter[1]), textureRadius);
+  const srcW = tex.sourceWidth || tex.width;
+  const srcH = tex.sourceHeight || tex.height;
+  const textureCenter = metadata.texture_center || [srcW / 2, srcH / 2];
+  const textureRadius = Number(metadata.texture_radius || Math.min(srcW, srcH) / 2);
+  const mapping = textureMapping(metadata, Number(textureCenter[0]), Number(textureCenter[1]), textureRadius, texScale(tex));
   const frame = layerObserverFrame(metadata);
   return { tex, mapping, frame };
 }
@@ -3150,16 +3356,21 @@ function layerSampler(layer) {
 // Sampler for one specific downloaded frame of a series member: texture comes
 // from the URL-keyed cache (loaded on demand), mapping from the frame's stored
 // WCS/heliographic record. The observer-frame tilt still references the current
-// base context, so the Carrington anchor cancels through correctly.
-async function frameSampler(layer, frame) {
+// base context, so the Carrington anchor cancels through correctly. full=true
+// decodes the source-resolution tier (single-frame analysis); the default
+// display tier keeps whole-series passes fast.
+async function frameSampler(layer, frame, full = false) {
   const url = `/data/cache/${frame.png}`;
-  await warmTexture(url, layer.created_at);
-  const tex = imageCache.get(url);
+  const key = full ? `${url}#full` : url;
+  await warmTexture(url, layer.created_at, full ? 0 : SERIES_TEXTURE_MAX_DIM, key);
+  const tex = imageCache.get(key);
   if (!tex) return null;
   const metadata = { ...(layer.metadata || {}), ...(frame.mapping || {}) };
-  const textureCenter = metadata.texture_center || [tex.width / 2, tex.height / 2];
-  const textureRadius = Number(metadata.texture_radius || Math.min(tex.width, tex.height) / 2);
-  const mapping = textureMapping(metadata, Number(textureCenter[0]), Number(textureCenter[1]), textureRadius);
+  const srcW = tex.sourceWidth || tex.width;
+  const srcH = tex.sourceHeight || tex.height;
+  const textureCenter = metadata.texture_center || [srcW / 2, srcH / 2];
+  const textureRadius = Number(metadata.texture_radius || Math.min(srcW, srcH) / 2);
+  const mapping = textureMapping(metadata, Number(textureCenter[0]), Number(textureCenter[1]), textureRadius, texScale(tex));
   const observerFrame = layerObserverFrame(metadata);
   return { tex, mapping, frame: observerFrame };
 }
@@ -3249,7 +3460,7 @@ async function generateLinePlot(region, line) {
     return;
   }
   const frame = entry && line.timeMode === "frame" ? entry.frames[line.frameIndex] : null;
-  const sampler = frame ? await frameSampler(layer, frame) : layerSampler(layer);
+  const sampler = frame ? await frameSampler(layer, frame, true) : layerSampler(layer);
   if (!sampler) {
     appendLog(`${line.name}: layer missing, cannot plot`, "error");
     return;
@@ -3670,17 +3881,46 @@ function render() {
   updateCoordinateReadout();
 }
 
+let surfaceProjectionMemo = null;
+function surfaceProjection(w, h, cx, cy, r) {
+  const key = [w, h, cx, cy, r, viewQuat.w, viewQuat.x, viewQuat.y, viewQuat.z].join(',');
+  if (surfaceProjectionMemo?.key === key) return surfaceProjectionMemo;
+  const minX = Math.max(0, Math.floor(cx - r)), maxX = Math.min(w - 1, Math.ceil(cx + r));
+  const minY = Math.max(0, Math.floor(cy - r)), maxY = Math.min(h - 1, Math.ceil(cy + r));
+  const capacity = Math.max(0, maxX - minX + 1) * Math.max(0, maxY - minY + 1);
+  const xyz = new Float64Array(capacity * 3), offsets = new Uint32Array(capacity);
+  const qw = viewQuat.w, qx = -viewQuat.x, qy = -viewQuat.y, qz = -viewQuat.z;
+  let count = 0;
+  for (let py = minY; py <= maxY; py++) {
+    const dy = (py - cy) / r, rrY = dy * dy;
+    for (let px = minX; px <= maxX; px++) {
+      const dx = (px - cx) / r, rr = dx * dx + rrY;
+      if (rr > 1) continue;
+      const vz = Math.sqrt(1 - rr), vx = dx, vy = -dy;
+      const t2x = 2 * (qy * vz - qz * vy), t2y = 2 * (qz * vx - qx * vz), t2z = 2 * (qx * vy - qy * vx);
+      xyz[count * 3] = vx + qw * t2x + (qy * t2z - qz * t2y);
+      xyz[count * 3 + 1] = vy + qw * t2y + (qz * t2x - qx * t2z);
+      xyz[count * 3 + 2] = vz + qw * t2z + (qx * t2y - qy * t2x);
+      offsets[count++] = (py * w + px) * 4;
+    }
+  }
+  surfaceProjectionMemo = { key, xyz, offsets, count };
+  return surfaceProjectionMemo;
+}
+
 function drawTexture(out, w, h, cx, cy, r, tex, opacity, metadata) {
   const minX = Math.max(0, Math.floor(cx - r));
   const maxX = Math.min(w - 1, Math.ceil(cx + r));
   const minY = Math.max(0, Math.floor(cy - r));
   const maxY = Math.min(h - 1, Math.ceil(cy + r));
   const alphaScale = clamp(opacity, 0, 1);
-  const textureCenter = metadata.texture_center || [tex.width / 2, tex.height / 2];
-  const textureRadius = Number(metadata.texture_radius || Math.min(tex.width, tex.height) / 2);
+  const srcW = tex.sourceWidth || tex.width;
+  const srcH = tex.sourceHeight || tex.height;
+  const textureCenter = metadata.texture_center || [srcW / 2, srcH / 2];
+  const textureRadius = Number(metadata.texture_radius || Math.min(srcW, srcH) / 2);
   const tcx = Number(textureCenter[0]);
   const tcy = Number(textureCenter[1]);
-  const mapping = textureMapping(metadata, tcx, tcy, textureRadius);
+  const mapping = textureMapping(metadata, tcx, tcy, textureRadius, texScale(tex));
   const mCx = mapping.centerX;
   const mCy = mapping.centerY;
   const mRx = mapping.radiusX;
@@ -3692,11 +3932,7 @@ function drawTexture(out, w, h, cx, cy, r, tex, opacity, metadata) {
   const tw = tex.width;
   const th = tex.height;
   const td = tex.data;
-  // Inverse view rotation inlined: quatRotate(conj(viewQuat), v) without per-pixel allocation.
-  const qw = viewQuat.w;
-  const qx = -viewQuat.x;
-  const qy = -viewQuat.y;
-  const qz = -viewQuat.z;
+  const projection = surfaceProjection(w, h, cx, cy, r);
   // Multi-epoch alignment: transform the base-frame vector into this layer's
   // own observer frame before sampling (identity for the reference layer).
   const frame = layerObserverFrame(metadata);
@@ -3707,22 +3943,10 @@ function drawTexture(out, w, h, cx, cy, r, tex, opacity, metadata) {
   const fSbI = frame ? frame.sbI : 0;
   const fCbI = frame ? frame.cbI : 1;
 
-  for (let py = minY; py <= maxY; py++) {
-    const dy = (py - cy) / r;
-    const rrY = dy * dy;
-    for (let px = minX; px <= maxX; px++) {
-      const dx = (px - cx) / r;
-      const rr = dx * dx + rrY;
-      if (rr > 1) continue;
-      const vz = Math.sqrt(1 - rr);
-      const vx = dx;
-      const vy = -dy;
-      const t2x = 2 * (qy * vz - qz * vy);
-      const t2y = 2 * (qz * vx - qx * vz);
-      const t2z = 2 * (qx * vy - qy * vx);
-      const wx = vx + qw * t2x + (qy * t2z - qz * t2y);
-      const wy = vy + qw * t2y + (qz * t2x - qx * t2z);
-      const wz = vz + qw * t2z + (qx * t2y - qy * t2x);
+  for (let i = 0; i < projection.count; i++) {
+      const wx = projection.xyz[i * 3];
+      const wy = projection.xyz[i * 3 + 1];
+      const wz = projection.xyz[i * 3 + 2];
       let sx = wx;
       let sy = wy;
       let sz = wz;
@@ -3744,22 +3968,23 @@ function drawTexture(out, w, h, cx, cy, r, tex, opacity, metadata) {
       const si = (ty * tw + tx) * 4;
       const a = (td[si + 3] / 255) * alphaScale;
       if (a <= 0) continue;
-      const di = (py * w + px) * 4;
+      const di = projection.offsets[i];
       out[di] = out[di] * (1 - a) + td[si] * a;
       out[di + 1] = out[di + 1] * (1 - a) + td[si + 1] * a;
       out[di + 2] = out[di + 2] * (1 - a) + td[si + 2] * a;
       out[di + 3] = 255;
-    }
   }
 }
 
 function drawCoronaTexture(out, w, h, cx, cy, r, tex, opacity, metadata) {
-  const textureCenter = metadata.texture_center || [tex.width / 2, tex.height / 2];
-  const textureRadius = Number(metadata.texture_radius || Math.min(tex.width, tex.height) / 2);
+  const srcW = tex.sourceWidth || tex.width;
+  const srcH = tex.sourceHeight || tex.height;
+  const textureCenter = metadata.texture_center || [srcW / 2, srcH / 2];
+  const textureRadius = Number(metadata.texture_radius || Math.min(srcW, srcH) / 2);
   const tcx = Number(textureCenter[0]);
   const tcy = Number(textureCenter[1]);
   const alphaScale = clamp(opacity, 0, 1);
-  const mapping = textureMapping(metadata, tcx, tcy, textureRadius);
+  const mapping = textureMapping(metadata, tcx, tcy, textureRadius, texScale(tex));
   const mCx = mapping.centerX;
   const mCy = mapping.centerY;
   const mRx = mapping.radiusX;
@@ -3815,25 +4040,24 @@ function drawCoronaTexture(out, w, h, cx, cy, r, tex, opacity, metadata) {
   }
 }
 
-function sampleVisibleSurfaceLayers(basePoint) {
+function surfaceLayerSamplers() {
+  return layers.filter(layer => layer.visible && layerMode(layer) === panelMode &&
+    layer.kind === 'image' && layer.metadata?.render_mode !== 'corona').flatMap(layer => {
+      const sampler = layerSampler(layer);
+      return sampler ? [{ ...sampler, opacity: clamp(layer.opacity, 0, 1) }] : [];
+    });
+}
+
+function sampleVisibleSurfaceLayers(basePoint, samplers = surfaceLayerSamplers()) {
   if (basePoint.z < 0) return [5, 7, 10, 255];
   let out = [5, 7, 10, 255];
-  const visibleLayers = layers.filter((layer) => layer.visible && layerMode(layer) === panelMode && layer.kind === "image");
-  for (const layer of visibleLayers) {
-    const tex = textureGet(layer);
-    if (!tex) continue;
-    const metadata = layer.metadata || {};
-    if (metadata.render_mode === "corona") continue;
-    const frame = layerObserverFrame(metadata);
+  for (const { tex, mapping, frame, opacity } of samplers) {
     const point = frame ? applyObserverFrame(frame, basePoint) : basePoint;
-    if (point.z < 0) continue;  // this spot was on the far side for that epoch
-    const textureCenter = metadata.texture_center || [tex.width / 2, tex.height / 2];
-    const textureRadius = Number(metadata.texture_radius || Math.min(tex.width, tex.height) / 2);
-    const mapping = textureMapping(metadata, Number(textureCenter[0]), Number(textureCenter[1]), textureRadius);
+    if (point.z < 0) continue;
     const sample = planeToTexture(point.x, point.y, mapping);
     if (sample.tx < 0 || sample.tx >= tex.width || sample.ty < 0 || sample.ty >= tex.height) continue;
     const si = (sample.ty * tex.width + sample.tx) * 4;
-    const a = (tex.data[si + 3] / 255) * clamp(layer.opacity, 0, 1);
+    const a = (tex.data[si + 3] / 255) * opacity;
     if (a <= 0) continue;
     out[0] = out[0] * (1 - a) + tex.data[si] * a;
     out[1] = out[1] * (1 - a) + tex.data[si + 1] * a;
@@ -3882,7 +4106,11 @@ function applyObserverFrame(frame, v) {
   };
 }
 
-function textureMapping(metadata, tcx, tcy, fallbackRadius) {
+// All pixel-space WCS quantities (crpix, sun_radius_pixels, crval/cdelt) refer
+// to the ORIGINAL image resolution. The stored texture may be a downscaled
+// display tier, so every pixel-space output is multiplied by `scale`
+// (tex.width / tex.sourceWidth, i.e. 1 for full-resolution textures).
+function textureMapping(metadata, tcx, tcy, fallbackRadius, scale = 1) {
   const wcs = metadata.wcs || {};
   const cdelt = Array.isArray(wcs.cdelt) ? wcs.cdelt : [];
   const crval = Array.isArray(wcs.crval) ? wcs.crval : [];
@@ -3898,12 +4126,12 @@ function textureMapping(metadata, tcx, tcy, fallbackRadius) {
   const degrees = Number(wcs.crota ?? metadata.rotation ?? metadata.rotation_deg ?? 0);
   const radians = degrees * Math.PI / 180;
   return {
-    centerX,
-    centerY,
-    radiusX: radiusX || fallbackRadius,
-    radiusY: radiusY || fallbackRadius,
-    crvalX,
-    crvalY,
+    centerX: centerX * scale,
+    centerY: centerY * scale,
+    radiusX: (radiusX || fallbackRadius) * scale,
+    radiusY: (radiusY || fallbackRadius) * scale,
+    crvalX: crvalX * scale,
+    crvalY: crvalY * scale,
     c: Math.cos(radians),
     s: Math.sin(radians),
   };

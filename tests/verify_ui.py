@@ -797,6 +797,120 @@ def run() -> None:
             check("series 2 scrub (skipped: no scrub-able stack)", True, f"frames={n2}")
             page.screenshot(path=str(SHOTS / "shot-03g-series.png"))
 
+        # 4g-tex. Texture tiers: display-res playback tier, adaptive LRU cap,
+        # warm-all pre-decode, in-flight dedup, and the full-res pause tier.
+        if loaded2 and n2 >= 2:
+            tex_probe = page.evaluate("""(() => {
+              const out = [];
+              for (const [, e] of seriesLayers.entries()) {
+                for (const f of e.frames) {
+                  const tex = imageCache.get(`/data/cache/${f.png}`);
+                  if (tex) out.push({ w: tex.width, sw: tex.sourceWidth || tex.width });
+                }
+              }
+              return out;
+            })()""")
+            check("series frames stored at display resolution",
+                  len(tex_probe) > 0 and all(t["w"] <= 1024 for t in tex_probe),
+                  f"widths={[t['w'] for t in tex_probe][:6]}")
+            check("display tier records the source size",
+                  all(t["sw"] >= t["w"] for t in tex_probe),
+                  f"sample={tex_probe[:2]}")
+            cap_probe = page.evaluate("""(() => {
+              let frames = 0;
+              for (const e of seriesLayers.values()) frames += e.frames.length;
+              return { cap: textureCacheCap(), frames };
+            })()""")
+            check("texture cache cap adapts to the loaded series",
+                  cap_probe["cap"] >= cap_probe["frames"] + 8,
+                  f"cap={cap_probe['cap']} frames={cap_probe['frames']}")
+            dedup_probe = page.evaluate("""(() => {
+              const entry = [...seriesLayers.values()][0];
+              const url = `/data/cache/${entry.frames[0].png}`; // real file: no 404 noise
+              const p1 = warmTexture(url, '', 0, '__dedup__');
+              const p2 = warmTexture(url, '', 0, '__dedup__');
+              p1.then(() => imageCache.delete('__dedup__'));
+              return { same: p1 === p2, inflight: textureInflight.has('__dedup__') };
+            })()""")
+            check("concurrent warms share one in-flight decode",
+                  dedup_probe["same"] and dedup_probe["inflight"], str(dedup_probe))
+            page.evaluate("warmAllSeriesFrames(activeSeriesId)")
+            warmed_all = False
+            try:
+                page.wait_for_function("""(() => {
+                  for (const [, e] of seriesLayers.entries()) {
+                    for (const f of e.frames) if (!imageCache.has(`/data/cache/${f.png}`)) return false;
+                  }
+                  return true;
+                })()""", timeout=60000)
+                warmed_all = True
+            except Exception:
+                pass
+            check("warm-all pre-decodes every series frame", warmed_all)
+            # Playback must not rebuild the layer rows (only the date text swaps).
+            row_handle = page.locator(".layer").last.element_handle()
+            page.evaluate("startSeriesPlay()")
+            page.wait_for_timeout(900)
+            check("playback does not rebuild layer rows",
+                  page.evaluate("(el) => el.isConnected", row_handle),
+                  "row element survived several frames")
+            page.evaluate("pauseSeriesPlay()")
+            # The full-resolution tier warms on demand for the current frames.
+            page.evaluate("warmFullResCurrentFrames()")
+            full_ready = False
+            try:
+                page.wait_for_function("""(() => {
+                  for (const [, e] of seriesLayers.entries()) {
+                    const f = e.frames[e.index];
+                    if (f && !imageCache.has(`/data/cache/${f.png}#full`)) return false;
+                  }
+                  return true;
+                })()""", timeout=30000)
+                full_ready = True
+            except Exception:
+                pass
+            check("on-demand warm fills the full-resolution tier", full_ready)
+            full_probe = page.evaluate("""(() => {
+              const [, e] = [...seriesLayers.entries()].filter(([, x]) => x.seriesId === activeSeriesId)[0];
+              const f = e.frames[e.index];
+              const full = imageCache.get(`/data/cache/${f.png}#full`);
+              const disp = imageCache.get(`/data/cache/${f.png}`);
+              return { fw: full && full.width, fsw: full && full.sourceWidth, dw: disp && disp.width };
+            })()""")
+            check("full tier keeps source resolution",
+                  bool(full_probe["fw"]) and full_probe["fw"] == full_probe["fsw"]
+                  and (not full_probe["dw"] or full_probe["fw"] >= full_probe["dw"]),
+                  str(full_probe))
+            # The scale-aware mapping must land on the same RELATIVE texel in
+            # both tiers — this is the downscale correction math itself.
+            scale_probe = page.evaluate("""(() => {
+              const pair = [...seriesLayers.entries()].filter(([, x]) => x.seriesId === activeSeriesId)[0];
+              const [layerId] = pair;
+              const layer = layers.find((l) => l.id === layerId);
+              const disp = textureGet(layer);
+              const full = textureGet({ image_url: `${layer.image_url}#full`, id: `${layer.image_url}#full` });
+              if (!disp || !full) return null;
+              const mk = (tex) => {
+                const md = layer.metadata || {};
+                const sw = tex.sourceWidth || tex.width, sh = tex.sourceHeight || tex.height;
+                const tc = md.texture_center || [sw / 2, sh / 2];
+                const tr = Number(md.texture_radius || Math.min(sw, sh) / 2);
+                return textureMapping(md, Number(tc[0]), Number(tc[1]), tr, texScale(tex));
+              };
+              const sd = planeToTexture(0.31, -0.22, mk(disp));
+              const sf = planeToTexture(0.31, -0.22, mk(full));
+              return { rd: [sd.tx / disp.width, sd.ty / disp.height],
+                       rf: [sf.tx / full.width, sf.ty / full.height] };
+            })()""")
+            scale_ok = bool(scale_probe) and all(
+                abs(a - b) < 0.01 for a, b in zip(scale_probe["rd"], scale_probe["rf"]))
+            check("downscaled tier maps to the same relative texels",
+                  scale_ok, str(scale_probe))
+            page.evaluate(f"scrubSeriesTo({n2 - 1})") # restore for the playback block
+            page.wait_for_timeout(300)
+        else:
+            check("texture tiers (skipped: series 2 not loaded)", True)
+
         # 4h. Series playback: play/pause toggle, wrap-around, fps, step buttons.
         if loaded2 and n2 >= 3:
             def s2_index():
